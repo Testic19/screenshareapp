@@ -57,18 +57,13 @@ function initPeer() {
       iceServers: [
         { urls: 'stun:stun.l.google.com:19302' },
         { urls: 'stun:stun1.l.google.com:19302' },
-        // Free public TURN relay (fallback for strict NAT/firewall).
-        // For best reliability, replace with your own TURN credentials.
-        {
-          urls: 'turn:openrelay.metered.ca:80',
-          username: 'openrelayproject',
-          credential: 'openrelayproject'
-        },
-        {
-          urls: 'turn:openrelay.metered.ca:443',
-          username: 'openrelayproject',
-          credential: 'openrelayproject'
-        }
+        { urls: 'stun:stun.cloudflare.com:3478' },
+        // Free public TURN relays (fallback for strict NAT/firewall).
+        // TCP/443 probija skoro sve firewall-e. Za max pouzdanost stavi svoj.
+        { urls: 'turn:openrelay.metered.ca:80', username: 'openrelayproject', credential: 'openrelayproject' },
+        { urls: 'turn:openrelay.metered.ca:443', username: 'openrelayproject', credential: 'openrelayproject' },
+        { urls: 'turn:openrelay.metered.ca:443?transport=tcp', username: 'openrelayproject', credential: 'openrelayproject' },
+        { urls: 'turns:openrelay.metered.ca:443?transport=tcp', username: 'openrelayproject', credential: 'openrelayproject' }
       ]
     }
   });
@@ -82,7 +77,7 @@ function initPeer() {
 
   // Someone is sharing their screen to us.
   peer.on('call', (call) => {
-    log(`Dolazni stream od ${call.peer}`);
+    log(`Dolazni poziv od ${call.peer}`);
     remotePeerId = remotePeerId || call.peer;
     call.answer(); // we answer as a viewer (no outgoing stream required)
     wireIncoming(call);
@@ -111,22 +106,97 @@ function initPeer() {
 // Display an incoming remote stream.
 function wireIncoming(call) {
   activeCalls.set(call.peer, call);
-  call.on('stream', (stream) => {
-    remoteVideo.srcObject = stream;
-    placeholder.classList.add('hidden');
-    setStatus('UŽIVO — gledaš ekran drugara', 'live');
-    log('Stream aktivan.');
-  });
+  call.on('stream', (stream) => showRemote(call, stream));
   call.on('close', () => {
     log(`Veza sa ${call.peer} zatvorena.`);
     if (remoteVideo.srcObject) {
       remoteVideo.srcObject = null;
       placeholder.classList.remove('hidden');
     }
+    stopStats();
     setStatus('Veza zatvorena', 'ready');
     activeCalls.delete(call.peer);
   });
   call.on('error', (e) => log(`Greška poziva: ${e}`));
+}
+
+// Show a received remote stream + run on-screen diagnostics.
+function showRemote(call, stream) {
+  remoteVideo.srcObject = stream;
+  placeholder.classList.add('hidden');
+  // Explicit play() — Electron autoplay policy can leave it paused (black).
+  remoteVideo.play().catch((e) => log('play() blokiran: ' + e.message));
+  log(`Stream primljen (${stream.getVideoTracks().length} video track).`);
+  withPC(call, (pc) => {
+    monitorPC(pc, 'prijem');
+    startStats(pc);
+  });
+}
+
+// Wait until PeerJS has created the RTCPeerConnection, then run cb.
+function withPC(call, cb, tries = 0) {
+  const pc = call.peerConnection;
+  if (pc) return cb(pc);
+  if (tries > 60) return log('RTCPeerConnection nije napravljen.');
+  setTimeout(() => withPC(call, cb, tries + 1), 100);
+}
+
+// Log ICE/connection state so we can see WHERE it breaks.
+function monitorPC(pc, role) {
+  pc.addEventListener('iceconnectionstatechange', () => {
+    log(`ICE (${role}): ${pc.iceConnectionState}`);
+    if (pc.iceConnectionState === 'failed') {
+      setStatus('Mreža blokira P2P — potreban je radni TURN server', 'error');
+    }
+  });
+  pc.addEventListener('icecandidate', (e) => {
+    if (e.candidate && e.candidate.type === 'relay') log('Koristi se TURN relay ✓');
+  });
+}
+
+// Every second, read inbound video stats → tells us capture-vs-network.
+let statsTimer = null;
+function stopStats() {
+  if (statsTimer) clearInterval(statsTimer);
+  statsTimer = null;
+}
+function startStats(pc) {
+  stopStats();
+  let lastBytes = 0;
+  let lastTs = 0;
+  let zeroCount = 0;
+  statsTimer = setInterval(async () => {
+    let stats;
+    try {
+      stats = await pc.getStats();
+    } catch {
+      return;
+    }
+    stats.forEach((r) => {
+      if (r.type !== 'inbound-rtp' || r.kind !== 'video') return;
+      const mbps =
+        lastTs && r.timestamp > lastTs
+          ? (((r.bytesReceived - lastBytes) * 8) / (r.timestamp - lastTs) / 1000).toFixed(1)
+          : '…';
+      lastBytes = r.bytesReceived;
+      lastTs = r.timestamp;
+      const fps = r.framesPerSecond != null ? Math.round(r.framesPerSecond) : 0;
+
+      if (r.frameWidth && r.framesReceived > 0) {
+        // Frames ARE arriving → connection + capture OK.
+        setStatus(`UŽIVO — ${r.frameWidth}×${r.frameHeight} @ ${fps}fps · ${mbps} Mbps`, 'live');
+      } else {
+        // Stream exists but no pixels → almost always network/TURN.
+        zeroCount++;
+        setStatus(
+          zeroCount > 4
+            ? '⚠ Nema video frejmova — mreža blokira P2P (TURN problem)'
+            : 'Povezivanje video toka…',
+          zeroCount > 4 ? 'error' : 'waiting'
+        );
+      }
+    });
+  }, 1000);
 }
 
 // ---------------------------------------------------------------------------
@@ -178,9 +248,9 @@ async function startCapture(sourceId) {
         mandatory: {
           chromeMediaSource: 'desktop',
           chromeMediaSourceId: sourceId,
-          minWidth: w,
+          // Only cap the size (no min): forcing an exact resolution can make
+          // macOS capture return black frames.
           maxWidth: w,
-          minHeight: h,
           maxHeight: h,
           maxFrameRate: fps
         }
@@ -206,10 +276,13 @@ async function startCapture(sourceId) {
 
     localStream = stream;
     localVideo.srcObject = stream;
+    localVideo.play().catch(() => {});
     pipWrap.classList.remove('hidden');
     shareBtn.disabled = true;
     stopBtn.disabled = false;
-    log(`Deljenje: ${w}x${h} @ ${fps}fps (${mode})`);
+    const s = stream.getVideoTracks()[0].getSettings();
+    log(`Hvatam: ${s.width || '?'}x${s.height || '?'} @ ${Math.round(s.frameRate) || '?'}fps (${mode})`);
+    log('↳ Ako je tvoj mali preview (dole desno) crn, problem je snimanje ekrana/dozvola.');
 
     // If a friend code is set, start streaming to them.
     if (remotePeerId) startCall(remotePeerId);
@@ -227,16 +300,13 @@ function startCall(id) {
   if (!localStream) return;
   const call = peer.call(id, localStream);
   activeCalls.set(id, call);
-  call.on('stream', (stream) => {
-    // The other side may also be sharing back.
-    remoteVideo.srcObject = stream;
-    placeholder.classList.add('hidden');
-  });
+  // The other side may also be sharing back to us on this same call.
+  call.on('stream', (stream) => showRemote(call, stream));
   call.on('error', (e) => log('Greška poziva: ' + e));
 
-  // Apply high bitrate once the RTCPeerConnection is up.
+  withPC(call, (pc) => monitorPC(pc, 'slanje'));
   applyQuality(call);
-  setStatus('UŽIVO — deliš ekran', 'live');
+  setStatus('Šaljem ekran drugaru…', 'live');
   log(`Zovem ${id} sa mojim ekranom.`);
 }
 
