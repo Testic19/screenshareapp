@@ -1,0 +1,114 @@
+<!doctype html>
+<html lang="sr">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta http-equiv="Content-Security-Policy"
+        content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; media-src 'self' blob:; connect-src 'self' https: wss:;" />
+  <title>ScreenShareP2P</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div id="app">
+    <!-- Sidebar / controls -->
+    <aside class="panel">
+      <h1 class="logo">📺 ScreenShare<span>P2P</span></h1>
+
+      <section class="card">
+        <label class="lbl">Tvoj kod (daj ovo drugaru)</label>
+        <div class="row">
+          <input id="myId" class="input mono" readonly value="…povezivanje…" />
+          <button id="copyId" class="btn ghost" title="Kopiraj">⧉</button>
+        </div>
+        <div id="status" class="status waiting">Povezivanje na signaling…</div>
+      </section>
+
+      <section class="card">
+        <label class="lbl">Poveži se sa drugarom (ukucaj njegov kod)</label>
+        <div class="row">
+          <input id="remoteId" class="input mono" placeholder="npr. abc123" />
+          <button id="connectBtn" class="btn">Poveži</button>
+        </div>
+      </section>
+
+      <section class="card">
+        <label class="lbl">Kvalitet</label>
+        <div class="grid2">
+          <div>
+            <span class="sub">Bitrate</span>
+            <select id="bitrate" class="input">
+              <option value="8000000">8 Mbps</option>
+              <option value="15000000" selected>15 Mbps</option>
+              <option value="25000000">25 Mbps</option>
+              <option value="40000000">40 Mbps (LAN)</option>
+            </select>
+          </div>
+          <div>
+            <span class="sub">FPS</span>
+            <select id="fps" class="input">
+              <option value="30">30</option>
+              <option value="60" selected>60</option>
+            </select>
+          </div>
+        </div>
+        <div class="grid2">
+          <div>
+            <span class="sub">Rezolucija</span>
+            <select id="res" class="input">
+              <option value="1280x720">720p</option>
+              <option value="1920x1080" selected>1080p</option>
+              <option value="2560x1440">1440p</option>
+              <option value="3840x2160">2160p</option>
+            </select>
+          </div>
+          <div>
+            <span class="sub">Režim</span>
+            <select id="mode" class="input">
+              <option value="motion" selected>Gaming (gladak)</option>
+              <option value="text">Tekst/Kod (oštar)</option>
+            </select>
+          </div>
+        </div>
+        <label class="check"><input type="checkbox" id="mic" /> Uključi mikrofon</label>
+      </section>
+
+      <section class="card">
+        <button id="shareBtn" class="btn primary big" disabled>▶ Podeli moj ekran</button>
+        <button id="stopBtn" class="btn danger big" disabled>■ Zaustavi deljenje</button>
+      </section>
+
+      <div id="log" class="log"></div>
+    </aside>
+
+    <!-- Video area -->
+    <main class="stage">
+      <video id="remoteVideo" autoplay playsinline></video>
+      <div id="placeholder" class="placeholder">
+        <div class="ph-inner">
+          <div class="ph-icon">🖥️</div>
+          <p>Ovde će se prikazati ekran drugara.</p>
+          <p class="sub">1. Pošalji svoj kod drugaru &nbsp;·&nbsp; 2. Neko klikne „Podeli moj ekran".</p>
+        </div>
+      </div>
+      <div id="pipWrap" class="pip hidden">
+        <span class="pip-label">Ti šalješ</span>
+        <video id="localVideo" autoplay playsinline muted></video>
+      </div>
+    </main>
+  </div>
+
+  <!-- Source picker modal -->
+  <div id="picker" class="modal hidden">
+    <div class="modal-box">
+      <div class="modal-head">
+        <h2>Izaberi šta deliš</h2>
+        <button id="pickerClose" class="btn ghost">✕</button>
+      </div>
+      <div id="sourceList" class="sources"></div>
+    </div>
+  </div>
+
+  <script src="../node_modules/peerjs/dist/peerjs.min.js"></script>
+  <script src="renderer.js"></script>
+</body>
+</html>

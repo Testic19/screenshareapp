@@ -1,0 +1,42 @@
+{
+  "name": "screenshare-p2p",
+  "version": "0.1.0",
+  "description": "High-quality peer-to-peer screen sharing for Windows and macOS",
+  "main": "src/main.js",
+  "author": "",
+  "license": "MIT",
+  "scripts": {
+    "start": "electron .",
+    "dist": "electron-builder",
+    "dist:win": "electron-builder --win",
+    "dist:mac": "electron-builder --mac"
+  },
+  "devDependencies": {
+    "electron": "^30.0.0",
+    "electron-builder": "^24.13.3"
+  },
+  "dependencies": {
+    "peerjs": "^1.5.4"
+  },
+  "build": {
+    "appId": "com.screenshare.p2p",
+    "productName": "ScreenShareP2P",
+    "files": [
+      "src/**/*",
+      "node_modules/peerjs/dist/**/*"
+    ],
+    "win": {
+      "target": "nsis"
+    },
+    "mac": {
+      "target": "dmg",
+      "category": "public.app-category.utilities",
+      "entitlements": "build/entitlements.mac.plist",
+      "entitlementsInherit": "build/entitlements.mac.plist"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true
+    }
+  }
+}
