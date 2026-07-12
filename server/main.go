@@ -48,7 +48,7 @@ func main() {
 	// misconfigured range (the usual cause of "max retries exceeded").
 	checkRelayPorts(cfg.MinPort, cfg.MaxPort)
 
-	relayGen := &turn.RelayAddressGeneratorPortRange{
+	relayGen := &loggingGenerator{inner: &turn.RelayAddressGeneratorPortRange{
 		RelayAddress: net.ParseIP(cfg.PublicIP),
 		Address:      "0.0.0.0",
 		MinPort:      cfg.MinPort,
@@ -56,7 +56,7 @@ func main() {
 		// High retry count so allocation still finds a free/bindable port even
 		// when only a few ports in the range are usable.
 		MaxRetries: 100,
-	}
+	}}
 
 	var packetConns []turn.PacketConnConfig
 	var listenerConns []turn.ListenerConfig
@@ -66,6 +66,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("ne mogu da slušam UDP na %d: %v", cfg.Port, err)
 	}
+	tuneUDPBuffers(udpConn)
 	packetConns = append(packetConns, turn.PacketConnConfig{
 		PacketConn:            udpConn,
 		RelayAddressGenerator: relayGen,
@@ -173,6 +174,39 @@ func printBanner(c config) {
 	fmt.Printf("{ urls: 'turn:%s:%d?transport=tcp', username: '%s', credential: '%s' },\n", c.PublicIP, c.Port, user, pass)
 	fmt.Println("===========================================================")
 	fmt.Println()
+}
+
+// loggingGenerator wraps the port-range generator to log every relay
+// allocation (visibility for debugging) and to enlarge the socket buffers on
+// each relay conn — 60fps video bursts overflow small default UDP buffers,
+// which shows up as packet loss and a throttled bitrate.
+type loggingGenerator struct {
+	inner *turn.RelayAddressGeneratorPortRange
+}
+
+func (g *loggingGenerator) Validate() error { return g.inner.Validate() }
+
+func (g *loggingGenerator) AllocatePacketConn(network string, requestedPort int) (net.PacketConn, net.Addr, error) {
+	conn, addr, err := g.inner.AllocatePacketConn(network, requestedPort)
+	if err != nil {
+		log.Printf("relay alokacija NEUSPELA: %v", err)
+		return nil, nil, err
+	}
+	tuneUDPBuffers(conn)
+	log.Printf("relay alociran: %s", addr)
+	return conn, addr, nil
+}
+
+func (g *loggingGenerator) AllocateConn(network string, requestedPort int) (net.Conn, net.Addr, error) {
+	return g.inner.AllocateConn(network, requestedPort)
+}
+
+// tuneUDPBuffers raises socket buffers (best effort; kernel caps may apply).
+func tuneUDPBuffers(conn net.PacketConn) {
+	if u, ok := conn.(*net.UDPConn); ok {
+		_ = u.SetReadBuffer(4 << 20)
+		_ = u.SetWriteBuffer(4 << 20)
+	}
 }
 
 // checkRelayPorts tries to bind every UDP port in the range and reports how

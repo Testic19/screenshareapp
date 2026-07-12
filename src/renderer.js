@@ -80,7 +80,13 @@ function initPeer() {
   peer.on('call', (call) => {
     log(`Dolazni poziv od ${call.peer}`);
     remotePeerId = remotePeerId || call.peer;
-    call.answer(); // we answer as a viewer (no outgoing stream required)
+    // Replace any previous call with this peer — one connection at a time.
+    const existing = activeCalls.get(call.peer);
+    if (existing) existing.close();
+    // Answer WITH our stream when we're sharing: both directions ride ONE
+    // connection (half the TURN allocations of two separate calls).
+    call.answer(localStream || undefined);
+    if (localStream) log('Odgovaram sa svojim ekranom (dvosmerna veza).');
     wireIncoming(call);
   });
 
@@ -108,21 +114,41 @@ function initPeer() {
 function wireIncoming(call) {
   activeCalls.set(call.peer, call);
   call.on('stream', (stream) => showRemote(call, stream));
-  call.on('close', () => {
-    log(`Veza sa ${call.peer} zatvorena.`);
-    if (remoteVideo.srcObject) {
-      remoteVideo.srcObject = null;
-      placeholder.classList.remove('hidden');
-    }
+  call.on('close', () => handleCallClose(call));
+  call.on('error', (e) => log(`Greška poziva: ${e}`));
+}
+
+// Shared close handling: clean up only if this call is still the active one,
+// then try to re-establish automatically if we're still sharing.
+function handleCallClose(call) {
+  log(`Veza sa ${call.peer} zatvorena.`);
+  if (activeCalls.get(call.peer) === call) activeCalls.delete(call.peer);
+  // Clear the video only if it was THIS call's stream (a replacement call may
+  // already be showing a new one).
+  if (remoteVideo.srcObject && call._stream === remoteVideo.srcObject) {
+    remoteVideo.srcObject = null;
+    placeholder.classList.remove('hidden');
     stopStats();
     setStatus('Veza zatvorena', 'ready');
-    activeCalls.delete(call.peer);
-  });
-  call.on('error', (e) => log(`Greška poziva: ${e}`));
+  }
+  scheduleReconnect(call.peer);
+}
+
+// Auto-reconnect: if we're still sharing and no replacement call appeared,
+// call again after a short randomized delay (jitter avoids both sides
+// re-calling at the exact same moment).
+function scheduleReconnect(id) {
+  setTimeout(() => {
+    if (localStream && remotePeerId === id && !activeCalls.has(id)) {
+      log('Ponovno povezivanje…');
+      startCall(id);
+    }
+  }, 1000 + Math.random() * 1500);
 }
 
 // Show a received remote stream + run on-screen diagnostics.
 function showRemote(call, stream) {
+  call._stream = stream;
   remoteVideo.srcObject = stream;
   placeholder.classList.add('hidden');
   // Explicit play() — Electron autoplay policy can leave it paused (black).
@@ -308,9 +334,15 @@ async function startCapture(sourceId) {
     log(`Hvatam: ${s.width || '?'}x${s.height || '?'} @ ${Math.round(s.frameRate) || '?'}fps (${mode})`);
     log('↳ Ako je tvoj mali preview (dole desno) crn, problem je snimanje ekrana/dozvola.');
 
-    // If a friend code is set, start streaming to them.
-    if (remotePeerId) startCall(remotePeerId);
-    else log('Ukucaj kod drugara i klikni „Poveži" da počne prenos.');
+    // If a friend code is set, start streaming to them. Close any existing
+    // call first — the replacement carries BOTH directions on one connection.
+    if (remotePeerId) {
+      const existing = activeCalls.get(remotePeerId);
+      if (existing) existing.close();
+      startCall(remotePeerId);
+    } else {
+      log('Ukucaj kod drugara i klikni „Poveži" da počne prenos.');
+    }
 
     // Stop cleanly if the user ends capture from the OS.
     stream.getVideoTracks()[0].addEventListener('ended', stopSharing);
@@ -326,6 +358,7 @@ function startCall(id) {
   activeCalls.set(id, call);
   // The other side may also be sharing back to us on this same call.
   call.on('stream', (stream) => showRemote(call, stream));
+  call.on('close', () => handleCallClose(call));
   call.on('error', (e) => log('Greška poziva: ' + e));
 
   withPC(call, (pc) => monitorPC(pc, 'slanje'));
