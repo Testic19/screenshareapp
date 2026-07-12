@@ -1,17 +1,4 @@
-// ScreenShareP2P v0.2 — "nuklearna" arhitektura.
-// No WebRTC media stack: WebCodecs hardware H.264 at a LOCKED constant
-// bitrate, our own packetization + NACK retransmission, sent over UDP through
-// our Go forwarder (single port). We control everything the estimator used to.
-
-// ---------------------------------------------------------------------------
-// Server config
-// ---------------------------------------------------------------------------
-const SERVER_HOST = '40.160.64.73';
-const SERVER_PORT = 56969;
-const NET_USER = 'pera';
-const NET_PASS = 'promeniMe123';
-
-const FRAG_SIZE = 1150; // payload bytes per packet (fits MTU with headers)
+/* global Peer */
 
 // ---------------------------------------------------------------------------
 // Elements
@@ -24,13 +11,20 @@ const logBox = el('log');
 const shareBtn = el('shareBtn');
 const stopBtn = el('stopBtn');
 const connectBtn = el('connectBtn');
-const remoteCanvas = el('remoteCanvas');
-const canvasCtx = remoteCanvas.getContext('2d');
+const remoteVideo = el('remoteVideo');
 const localVideo = el('localVideo');
 const placeholder = el('placeholder');
 const pipWrap = el('pipWrap');
 const picker = el('picker');
 const sourceList = el('sourceList');
+
+// ---------------------------------------------------------------------------
+// State
+// ---------------------------------------------------------------------------
+let peer = null;
+let localStream = null;
+let activeCalls = new Map(); // peerId -> MediaConnection
+let remotePeerId = null;
 
 function log(msg) {
   const t = new Date().toLocaleTimeString();
@@ -44,39 +38,10 @@ function setStatus(text, cls) {
 }
 
 // ---------------------------------------------------------------------------
-// State
-// ---------------------------------------------------------------------------
-let myCode = '';
-let peerPresent = false;
-
-let localStream = null;
-let pumping = false;
-let pumpReader = null;
-let encoder = null;
-let sendFrameId = 0;
-let frameCounter = 0;
-let wantKey = false;
-const sentRing = new Map(); // frameId -> frags[] (retransmission buffer)
-
-let decoder = null;
-let decoderCodec = null;
-let lastDecoded = -1;
-const pending = new Map(); // frameId -> {frags[], got, count, key, tsMs, t0, nacks}
-const complete = new Map(); // frameId -> {data, key, tsMs, t0}
-let maxSeenFrame = -1;
-
-let e2eRtt = 0;
-const stats = {
-  outBytes: 0, outFrames: 0,
-  inBytes: 0, inFrames: 0, inFrags: 0,
-  nacksSent: 0, retx: 0,
-  lastW: 0, lastH: 0
-};
-
-// ---------------------------------------------------------------------------
-// Room / signaling over the forwarder
+// PeerJS setup — free public broker + STUN + fallback TURN
 // ---------------------------------------------------------------------------
 function shortId() {
+  // Human-friendly 6-char code from the alphabet minus ambiguous chars.
   const chars = 'abcdefghijkmnpqrstuvwxyz23456789';
   let s = '';
   const rnd = crypto.getRandomValues(new Uint8Array(6));
@@ -84,93 +49,266 @@ function shortId() {
   return s;
 }
 
-async function initNet() {
-  // GPU diagnostics up front — "hardware" here is the difference between
-  // buttery 60fps and a choked CPU encoder.
-  try {
-    const gpu = await window.desktop.gpuStatus();
-    log(`GPU: video_encode=${gpu.encode} | compositing=${gpu.compositing}`);
-    if (String(gpu.encode).includes('software')) {
-      log('⚠ Hardversko enkodiranje NIJE aktivno — kvalitet će patiti. Javi ovu liniju!');
+function initPeer() {
+  const id = shortId();
+  peer = new Peer(id, {
+    debug: 1,
+    config: {
+      // Google STUN first (tries a free DIRECT connection for best quality),
+      // then OUR own TURN relay (Pterodactyl) as the guaranteed fallback.
+      iceServers: [
+        { urls: 'stun:stun.l.google.com:19302' },
+        { urls: 'stun:stun1.l.google.com:19302' },
+        // --- Naš server (screenshare-turn na Pterodactylu) ---
+        { urls: 'stun:40.160.64.73:56969' },
+        { urls: 'turn:40.160.64.73:56969?transport=udp', username: 'pera', credential: 'promeniMe123' },
+        { urls: 'turn:40.160.64.73:56969?transport=tcp', username: 'pera', credential: 'promeniMe123' }
+      ]
+      // NB: no iceCandidatePoolSize — pooling would pre-open several TURN
+      // allocations per connection and exhaust the relay port range.
     }
-  } catch { /* diag only */ }
+  });
 
-  await window.net.start({ host: SERVER_HOST, port: SERVER_PORT, user: NET_USER, pass: NET_PASS });
-  myCode = shortId();
-  myIdInput.value = myCode;
-  window.net.join(myCode);
-  log(`Tvoj kod: ${myCode}`);
-  setStatus('Spreman — pošalji svoj kod drugaru', 'ready');
-  shareBtn.disabled = false;
+  peer.on('open', (openId) => {
+    myIdInput.value = openId;
+    setStatus('Spreman — pošalji svoj kod drugaru', 'ready');
+    shareBtn.disabled = false;
+    log(`Tvoj kod: ${openId}`);
+  });
 
-  window.net.onEvent(onNetEvent);
+  // Someone is sharing their screen to us.
+  peer.on('call', (call) => {
+    log(`Dolazni poziv od ${call.peer}`);
+    remotePeerId = remotePeerId || call.peer;
+    // Replace any previous call with this peer — one connection at a time.
+    const existing = activeCalls.get(call.peer);
+    if (existing) existing.close();
+    // Answer WITH our stream when we're sharing: both directions ride ONE
+    // connection (half the TURN allocations of two separate calls).
+    call.answer(localStream || undefined, { sdpTransform: sdpBoost });
+    if (localStream) log('Odgovaram sa svojim ekranom (dvosmerna veza).');
+    wireIncoming(call);
+  });
 
-  // E2E ping through the relay every 500ms while paired — feeds the adaptive
-  // rate controller (RTT bloat detection needs fresh samples).
-  setInterval(() => {
-    if (!peerPresent) return;
-    const b = new Uint8Array(10);
-    b[0] = 1; b[1] = 3;
-    new DataView(b.buffer).setFloat64(2, performance.now());
-    window.net.sendFrags([b], 'ctrl');
-  }, 500);
+  peer.on('error', (err) => {
+    log(`GREŠKA: ${err.type} — ${err.message}`);
+    if (err.type === 'unavailable-id') {
+      // Extremely rare collision — reinit with a new code.
+      setStatus('Kod zauzet, generišem novi…', 'waiting');
+      peer.destroy();
+      initPeer();
+    } else if (err.type === 'peer-unavailable') {
+      setStatus('Drugar nije dostupan (proveri kod)', 'error');
+    } else {
+      setStatus(`Greška: ${err.type}`, 'error');
+    }
+  });
+
+  peer.on('disconnected', () => {
+    setStatus('Signaling prekinut, ponovo se povezujem…', 'waiting');
+    peer.reconnect();
+  });
 }
 
-function onNetEvent(evt) {
-  switch (evt.type) {
-    case 'reg':
-      if (evt.peerPresent && !peerPresent) {
-        peerPresent = true;
-        log('Drugar je u sobi.');
-        setStatus('Povezan — možete da delite ekran', 'ready');
+// Display an incoming remote stream.
+function wireIncoming(call) {
+  activeCalls.set(call.peer, call);
+  call.on('stream', (stream) => showRemote(call, stream));
+  call.on('close', () => handleCallClose(call));
+  call.on('error', (e) => log(`Greška poziva: ${e}`));
+}
+
+// Shared close handling: clean up only if this call is still the active one,
+// then try to re-establish automatically if we're still sharing.
+function handleCallClose(call) {
+  log(`Veza sa ${call.peer} zatvorena.`);
+  if (activeCalls.get(call.peer) === call) activeCalls.delete(call.peer);
+  // Clear the video only if it was THIS call's stream (a replacement call may
+  // already be showing a new one).
+  if (remoteVideo.srcObject && call._stream === remoteVideo.srcObject) {
+    remoteVideo.srcObject = null;
+    placeholder.classList.remove('hidden');
+    stopStats();
+    setStatus('Veza zatvorena', 'ready');
+  }
+  scheduleReconnect(call.peer);
+}
+
+// Auto-reconnect: if we're still sharing and no replacement call appeared,
+// call again after a short randomized delay (jitter avoids both sides
+// re-calling at the exact same moment).
+function scheduleReconnect(id) {
+  setTimeout(() => {
+    if (localStream && remotePeerId === id && !activeCalls.has(id)) {
+      log('Ponovno povezivanje…');
+      startCall(id);
+    }
+  }, 1000 + Math.random() * 1500);
+}
+
+// Show a received remote stream + run on-screen diagnostics.
+function showRemote(call, stream) {
+  call._stream = stream;
+  remoteVideo.srcObject = stream;
+  placeholder.classList.add('hidden');
+  // Explicit play() — Electron autoplay policy can leave it paused (black).
+  remoteVideo.play().catch((e) => log('play() blokiran: ' + e.message));
+  log(`Stream primljen (${stream.getVideoTracks().length} video track).`);
+  withPC(call, (pc) => {
+    monitorPC(pc, 'prijem');
+    applySmoothness(pc);
+    startStats(pc);
+  });
+}
+
+// TURBO #3: a small receive-side buffer irons out network jitter and NACK
+// round-trips before display — micro-stutters vanish for ~120ms of latency.
+// "Tekst/Kod" mode keeps it tighter (sharper interaction, latency matters).
+function applySmoothness(pc) {
+  const hint = el('mode').value === 'text' ? 0.06 : 0.12;
+  pc.getReceivers().forEach((r) => {
+    try { r.playoutDelayHint = hint; } catch { /* unsupported */ }
+  });
+}
+
+// Wait until PeerJS has created the RTCPeerConnection, then run cb.
+function withPC(call, cb, tries = 0) {
+  const pc = call.peerConnection;
+  if (pc) return cb(pc);
+  if (tries > 60) return log('RTCPeerConnection nije napravljen.');
+  setTimeout(() => withPC(call, cb, tries + 1), 100);
+}
+
+// Log ICE/connection state so we can see WHERE it breaks.
+function monitorPC(pc, role) {
+  pc.addEventListener('iceconnectionstatechange', () => {
+    const st = pc.iceConnectionState;
+    log(`ICE (${role}): ${st}`);
+    if (st === 'connected' || st === 'completed') {
+      log('✓ VEZA uspostavljena!');
+      logSelectedPair(pc);
+    } else if (st === 'failed') {
+      setStatus('Direktna veza nije uspela — mreža blokira P2P', 'error');
+    }
+  });
+}
+
+// Show which addresses actually connected (confirms Tailscale 100.x usage).
+async function logSelectedPair(pc) {
+  try {
+    const stats = await pc.getStats();
+    let pairId = null;
+    stats.forEach((r) => {
+      if (r.type === 'transport' && r.selectedCandidatePairId) pairId = r.selectedCandidatePairId;
+    });
+    stats.forEach((r) => {
+      if (r.type === 'candidate-pair' && (r.id === pairId || r.selected)) {
+        const local = stats.get(r.localCandidateId);
+        const remote = stats.get(r.remoteCandidateId);
+        if (local && remote) {
+          log(`↳ Putanja: ${local.address} (${local.candidateType}) → ${remote.address} (${remote.candidateType})`);
+        }
       }
-      break;
-    case 'peer-joined':
-      peerPresent = true;
-      log('Drugar se povezao ✓');
-      setStatus('Povezan — možete da delite ekran', 'ready');
-      break;
-    case 'peer-left':
-      peerPresent = false;
-      log('Drugar je otišao.');
-      clearRemote();
-      setStatus('Drugar nije tu — čekam…', 'waiting');
-      break;
-    case 'data':
-      for (const buf of evt.bufs) onPayload(buf);
-      break;
-    case 'pong':
-      // server RTT available in evt.rtt if ever needed
-      break;
-    case 'error':
-      log('Mrežna greška: ' + evt.message);
-      break;
+    });
+    // Which codec actually won the negotiation? (H264 = hardware path)
+    setTimeout(async () => {
+      try {
+        const s2 = await pc.getStats();
+        s2.forEach((r) => {
+          if ((r.type === 'outbound-rtp' || r.type === 'inbound-rtp') && r.kind === 'video' && r.codecId) {
+            const c = s2.get(r.codecId);
+            if (c) log(`↳ Kodek (${r.type === 'outbound-rtp' ? 'šaljem' : 'primam'}): ${c.mimeType}`);
+          }
+        });
+      } catch { /* diag only */ }
+    }, 2000);
+  } catch {
+    /* ignore */
   }
 }
 
+// Every second, read inbound video stats → tells us capture-vs-network.
+let statsTimer = null;
+function stopStats() {
+  if (statsTimer) clearInterval(statsTimer);
+  statsTimer = null;
+}
+function startStats(pc) {
+  stopStats();
+  let inBytes = 0, inTs = 0, outBytes = 0, outTs = 0;
+  let zeroCount = 0;
+  statsTimer = setInterval(async () => {
+    let stats;
+    try {
+      stats = await pc.getStats();
+    } catch {
+      return;
+    }
+    let inbound = null, outbound = null;
+    stats.forEach((r) => {
+      if (r.kind !== 'video') return;
+      if (r.type === 'inbound-rtp') inbound = r;
+      if (r.type === 'outbound-rtp') outbound = r;
+    });
+
+    let outTxt = '';
+    if (outbound) {
+      const mbps = outTs && outbound.timestamp > outTs
+        ? ((outbound.bytesSent - outBytes) * 8 / (outbound.timestamp - outTs) / 1000).toFixed(1)
+        : '…';
+      outBytes = outbound.bytesSent;
+      outTs = outbound.timestamp;
+      const fps = outbound.framesPerSecond != null ? Math.round(outbound.framesPerSecond) : 0;
+      if (outbound.frameWidth) {
+        outTxt = `⇡ šalješ ${outbound.frameWidth}×${outbound.frameHeight} @ ${fps}fps · ${mbps} Mbps`;
+      }
+    }
+
+    if (inbound && inbound.frameWidth && inbound.framesReceived > 0) {
+      const mbps = inTs && inbound.timestamp > inTs
+        ? ((inbound.bytesReceived - inBytes) * 8 / (inbound.timestamp - inTs) / 1000).toFixed(1)
+        : '…';
+      inBytes = inbound.bytesReceived;
+      inTs = inbound.timestamp;
+      const fps = inbound.framesPerSecond != null ? Math.round(inbound.framesPerSecond) : 0;
+      const inTxt = `⇣ gledaš ${inbound.frameWidth}×${inbound.frameHeight} @ ${fps}fps · ${mbps} Mbps`;
+      setStatus(outTxt ? `${inTxt} | ${outTxt}` : `UŽIVO — ${inTxt}`, 'live');
+    } else if (outTxt) {
+      setStatus(`UŽIVO — ${outTxt}`, 'live');
+    } else if (inbound) {
+      zeroCount++;
+      setStatus(
+        zeroCount > 4
+          ? '⚠ Nema video frejmova — mreža blokira P2P (TURN problem)'
+          : 'Povezivanje video toka…',
+        zeroCount > 4 ? 'error' : 'waiting'
+      );
+    }
+  }, 1000);
+}
+
+// ---------------------------------------------------------------------------
+// Connect to a friend (store their code; media call does the rest)
+// ---------------------------------------------------------------------------
 connectBtn.addEventListener('click', () => {
-  const code = remoteIdInput.value.trim().toLowerCase();
-  if (!code) return;
-  window.net.join(code);
-  myIdInput.value = code;
-  log(`Ulazim u sobu: ${code}`);
-  setStatus('Čekam drugara u sobi…', 'waiting');
-});
-
-remoteIdInput.addEventListener('keydown', (e) => {
-  if (e.key === 'Enter') connectBtn.click();
-});
-
-el('copyId').addEventListener('click', () => {
-  navigator.clipboard.writeText(myIdInput.value);
-  log('Kod kopiran.');
+  const id = remoteIdInput.value.trim();
+  if (!id) return;
+  remotePeerId = id;
+  setStatus(`Povezan sa ${id} — možeš da deliš ekran`, 'ready');
+  log(`Postavljen drugar: ${id}`);
+  // If we're already sharing, immediately start streaming to them too.
+  if (localStream) startCall(id);
 });
 
 // ---------------------------------------------------------------------------
-// Capture + encode (sender)
+// Screen capture + high-quality tuning
 // ---------------------------------------------------------------------------
 shareBtn.addEventListener('click', async () => {
   const sources = await window.desktop.getSources();
+  renderPicker(sources);
+});
+
+function renderPicker(sources) {
   sourceList.innerHTML = '';
   sources.forEach((s) => {
     const div = document.createElement('div');
@@ -183,27 +321,45 @@ shareBtn.addEventListener('click', async () => {
     sourceList.appendChild(div);
   });
   picker.classList.remove('hidden');
-});
+}
 
 el('pickerClose').addEventListener('click', () => picker.classList.add('hidden'));
 
 async function startCapture(sourceId) {
-  // The resolution preset is a HEIGHT cap; width follows the source's native
-  // aspect ratio (ultrawide stays ultrawide — no stretching).
-  const presetH = Number(el('res').value.split('x')[1]);
+  const [w, h] = el('res').value.split('x').map(Number);
   const fps = Number(el('fps').value);
 
   try {
-    // Capture at NATIVE size first (no width/height constraints).
     const stream = await navigator.mediaDevices.getUserMedia({
       audio: false,
       video: {
         mandatory: {
           chromeMediaSource: 'desktop',
           chromeMediaSourceId: sourceId,
+          // Only cap the size (no min): forcing an exact resolution can make
+          // macOS capture return black frames.
+          maxWidth: w,
+          maxHeight: h,
           maxFrameRate: fps
         }
       }
+    });
+
+    // Optionally add microphone audio.
+    if (el('mic').checked) {
+      try {
+        const mic = await navigator.mediaDevices.getUserMedia({ audio: true });
+        mic.getAudioTracks().forEach((t) => stream.addTrack(t));
+        log('Mikrofon dodat.');
+      } catch (e) {
+        log('Mikrofon nije dostupan: ' + e.message);
+      }
+    }
+
+    // Content hint helps the encoder: "text" = sharp, "motion" = smooth.
+    const mode = el('mode').value;
+    stream.getVideoTracks().forEach((t) => {
+      t.contentHint = mode === 'text' ? 'detail' : 'motion';
     });
 
     localStream = stream;
@@ -212,527 +368,186 @@ async function startCapture(sourceId) {
     pipWrap.classList.remove('hidden');
     shareBtn.disabled = true;
     stopBtn.disabled = false;
+    const s = stream.getVideoTracks()[0].getSettings();
+    log(`Hvatam: ${s.width || '?'}x${s.height || '?'} @ ${Math.round(s.frameRate) || '?'}fps (${mode})`);
+    log('↳ Ako je tvoj mali preview (dole desno) crn, problem je snimanje ekrana/dozvola.');
 
-    const track = stream.getVideoTracks()[0];
-    let st = track.getSettings();
-    const natW = st.width, natH = st.height;
-    log(`Izvor: ${natW}x${natH} (ratio ${(natW / natH).toFixed(2)})`);
-
-    // Scale down to the preset height, keep ratio, force EVEN dimensions
-    // (H.264 hardware encoders reject odd sizes).
-    const even = (n) => Math.max(2, Math.round(n / 2) * 2);
-    let encH = Math.min(presetH, natH);
-    let encW = even(encH * (natW / natH));
-    encH = even(encH);
-    if (encW !== natW || encH !== natH) {
-      try {
-        await track.applyConstraints({ width: encW, height: encH, frameRate: fps });
-        st = track.getSettings();
-        encW = even(st.width || encW);
-        encH = even(st.height || encH);
-      } catch (e) {
-        log('Skaliranje nije uspelo (' + e.message + ') — šaljem native.');
-        encW = even(natW);
-        encH = even(natH);
-      }
+    // If a friend code is set, start streaming to them. Close any existing
+    // call first — the replacement carries BOTH directions on one connection.
+    if (remotePeerId) {
+      const existing = activeCalls.get(remotePeerId);
+      if (existing) existing.close();
+      startCall(remotePeerId);
+    } else {
+      log('Ukucaj kod drugara i klikni „Poveži" da počne prenos.');
     }
-    log(`Enkodiram: ${encW}x${encH} @ ${fps}fps`);
-    track.addEventListener('ended', stopSharing);
 
-    await startEncoder(track, encW, encH, fps);
+    // Stop cleanly if the user ends capture from the OS.
+    stream.getVideoTracks()[0].addEventListener('ended', stopSharing);
   } catch (e) {
     log('Greška pri hvatanju ekrana: ' + e.message);
     setStatus('Greška pri hvatanju ekrana', 'error');
   }
 }
 
-let encCandidates = [];
-let encCandidateIdx = 0;
-let encDims = { w: 0, h: 0, fps: 60 };
-let lastKeyTime = 0;
-let skipCount = 0;
-let encCount = 0;
+// Boost the bandwidth estimator via SDP: Chrome's estimator ramps slowly and
+// conservatively through a TURN relay (we measured the path clean at 40 Mbps
+// while the encoder sat at ~5). x-google-{start,min,max}-bitrate on the video
+// codecs makes the sender start high and never sink below a floor. The flags
+// take effect on the REMOTE side's sender, so both peers apply the transform
+// (call + answer) to boost both directions.
+function sdpBoost(sdp) {
+  const kbps = Math.round(Number(el('bitrate').value) / 1000);
+  // TURBO #3: aggressive floor — the estimator may wobble between 70% and
+  // 100% of the target, but never crater to kilobits on a motion burst.
+  const start = Math.round(kbps * 0.8);
+  const min = Math.round(kbps * 0.7);
+  const flags = `x-google-min-bitrate=${min};x-google-start-bitrate=${start};x-google-max-bitrate=${kbps}`;
 
-function encoderConfigFor(c, bps) {
-  const cfg = {
-    codec: c.codec,
-    hardwareAcceleration: c.hardwareAcceleration,
-    width: encDims.w,
-    height: encDims.h,
-    framerate: encDims.fps,
-    bitrate: bps,
-    latencyMode: 'realtime',
-    avc: { format: 'annexb' }
-  };
-  // Some hardware encoders reject 'constant' — candidates carry their mode.
-  if (c.bmode) cfg.bitrateMode = c.bmode;
-  return cfg;
-}
-
-async function startEncoder(track, w, h, fps) {
-  const bps = Number(el('bitrate').value);
-  window.net.setRate(bps);
-  encDims = { w, h, fps };
-
-  // Hardware first across H.264 profiles (High/Main/Baseline) and BOTH
-  // bitrate modes — many hardware encoders reject 'constant' but happily do
-  // 'variable' (we drive the rate ourselves anyway). Software comes last.
-  const all = [];
-  for (const hw of ['prefer-hardware', 'no-preference']) {
-    for (const codec of ['avc1.640034', 'avc1.4d0034', 'avc1.42E034']) {
-      for (const bmode of ['constant', null]) {
-        all.push({ codec, hardwareAcceleration: hw, bmode });
-      }
+  let lines = sdp.split('\r\n');
+  lines = preferH264(lines); // TURBO #1: hardware H.264 first in codec order
+  // Collect video codec payload types (skip rtx/red/fec).
+  const videoPts = new Set();
+  let inVideo = false;
+  for (const l of lines) {
+    if (l.startsWith('m=')) inVideo = l.startsWith('m=video');
+    else if (inVideo) {
+      const m = l.match(/^a=rtpmap:(\d+) (VP8|VP9|H264|AV1)/i);
+      if (m) videoPts.add(m[1]);
     }
   }
-  encCandidates = [];
-  for (const c of all) {
-    try {
-      const sup = await VideoEncoder.isConfigSupported(encoderConfigFor(c, bps));
-      if (sup.supported) encCandidates.push(c);
-    } catch { /* skip */ }
-  }
-  if (!encCandidates.length) {
-    log('GREŠKA: nijedan H.264 enkoder nije podržan?!');
-    setStatus('Enkoder nedostupan', 'error');
-    return;
-  }
-  encCandidateIdx = 0;
-  buildEncoder(bps);
-
-  pumping = true;
-  skipCount = 0;
-  encCount = 0;
-  const processor = new MediaStreamTrackProcessor({ track });
-  pumpReader = processor.readable.getReader();
-  (async () => {
-    while (pumping) {
-      const { value: frame, done } = await pumpReader.read().catch(() => ({ done: true }));
-      if (done || !frame) break;
-      if (peerPresent && encoder && encoder.state === 'configured' && encoder.encodeQueueSize <= 2) {
-        const now = performance.now();
-        const periodic = frameCounter % (encDims.fps * 4) === 0;
-        const kf = periodic || (wantKey && now - lastKeyTime > 300);
-        if (kf) { wantKey = false; lastKeyTime = now; }
-        try { encoder.encode(frame, { keyFrame: kf }); encCount++; } catch { /* closing */ }
-        frameCounter++;
-      } else if (peerPresent) {
-        skipCount++; // encoder busy -> frame dropped (visible in diagnostics)
-      }
-      frame.close();
+  // Append flags to existing fmtp lines; add fmtp for codecs without one (VP8).
+  const withFmtp = new Set();
+  const out = [];
+  for (const l of lines) {
+    const m = l.match(/^a=fmtp:(\d+) /);
+    if (m && videoPts.has(m[1])) {
+      out.push(`${l};${flags}`);
+      withFmtp.add(m[1]);
+    } else {
+      out.push(l);
     }
-  })();
-
-  setStatus('UŽIVO — šaljem (čekam statistiku…)', 'live');
+  }
+  const final = [];
+  for (const l of out) {
+    final.push(l);
+    const m = l.match(/^a=rtpmap:(\d+) (VP8|VP9|H264|AV1)/i);
+    if (m && !withFmtp.has(m[1])) {
+      final.push(`a=fmtp:${m[1]} ${flags}`);
+      withFmtp.add(m[1]);
+    }
+  }
+  return final.join('\r\n');
 }
 
-function buildEncoder(bps) {
-  const c = encCandidates[encCandidateIdx];
-  encoder = new VideoEncoder({
-    output: onEncodedChunk,
-    error: (e) => {
-      log(`Enkoder pao (${c.codec}/${c.hardwareAcceleration}): ${e.message}`);
-      try { encoder.close(); } catch { /* already */ }
-      // Auto-fallback to the next candidate (e.g. software) so sharing survives.
-      if (encCandidateIdx + 1 < encCandidates.length && pumping) {
-        encCandidateIdx++;
-        log('Prebacujem na sledeći enkoder…');
-        buildEncoder(Number(el('bitrate').value));
-      } else {
-        setStatus('Enkoder otkazao', 'error');
-      }
+// TURBO #1: reorder the m=video line so H264 payload types come first.
+// Chrome picks the first negotiated codec — H264 encodes on GPU/media-engine
+// (NVENC / Apple VideoToolbox) instead of a software VP8/VP9 encoder, which
+// is exactly what was choking 60fps motion scenes on the CPU.
+function preferH264(lines) {
+  let mIdx = -1;
+  const h264 = new Set();
+  let inVideo = false;
+  lines.forEach((l, i) => {
+    if (l.startsWith('m=video')) { mIdx = i; inVideo = true; }
+    else if (l.startsWith('m=')) inVideo = false;
+    else if (inVideo) {
+      const m = l.match(/^a=rtpmap:(\d+) H264\//i);
+      if (m) h264.add(m[1]);
     }
   });
-  encoder.configure(encoderConfigFor(c, bps));
-  decoderCodec = 'avc1.640034'; // decoder-side hint; High 5.2 decodes any profile below
-  wantKey = true;
-  log(`Enkoder: ${c.codec} (${c.hardwareAcceleration}, ${c.bmode || 'variable'}) · ${(bps / 1e6).toFixed(0)} Mbps · ${encDims.w}x${encDims.h}`);
+  if (mIdx === -1 || !h264.size) return lines;
+  const parts = lines[mIdx].split(' ');
+  const head = parts.slice(0, 3);
+  const pts = parts.slice(3);
+  lines[mIdx] = head
+    .concat(pts.filter((p) => h264.has(p)), pts.filter((p) => !h264.has(p)))
+    .join(' ');
+  return lines;
 }
 
-// ---------------------------------------------------------------------------
-// Adaptive rate control: hold the slider target, but back off BEFORE the link
-// melts (RTT bloat / reported loss), then climb back when clean. This is what
-// keeps a 20 Mbps uplink usable instead of 1000ms-ping bufferbloat.
-// ---------------------------------------------------------------------------
-let targetBps = 0;
-let rttBase = Infinity;
-let cleanSecs = 0;
-let lastRemoteLoss = 0;
+function startCall(id) {
+  if (!localStream) return;
+  const call = peer.call(id, localStream, { sdpTransform: sdpBoost });
+  activeCalls.set(id, call);
+  // The other side may also be sharing back to us on this same call.
+  call.on('stream', (stream) => showRemote(call, stream));
+  call.on('close', () => handleCallClose(call));
+  call.on('error', (e) => log('Greška poziva: ' + e));
 
-function adaptTick() {
-  if (!pumping || !encoder || encoder.state !== 'configured') return;
-  const slider = Number(el('bitrate').value);
-  if (!targetBps) targetBps = slider;
-
-  const rtt = e2eRtt || 0;
-  if (rtt) rttBase = Math.min(rttBase, rtt);
-  const bloated = rtt && rttBase !== Infinity && rtt > rttBase + 200;
-  const loss = lastRemoteLoss;
-  lastRemoteLoss = 0;
-
-  let next = targetBps;
-  let reason = '';
-  if (loss > 8 || (bloated && rtt > rttBase + 400)) {
-    next = targetBps * 0.55;
-    reason = loss > 8 ? `gubitak ${loss}%` : `RTT ${rtt}ms`;
-    cleanSecs = 0;
-  } else if (loss > 3 || bloated) {
-    next = targetBps * 0.8;
-    reason = loss > 3 ? `gubitak ${loss}%` : `RTT ${rtt}ms`;
-    cleanSecs = 0;
-  } else {
-    cleanSecs++;
-    if (cleanSecs >= 3 && targetBps < slider) {
-      next = Math.min(slider, targetBps * 1.15);
-      reason = 'link čist, dižem';
-    }
-  }
-  next = Math.max(3_000_000, Math.min(slider, next));
-  if (Math.abs(next - targetBps) > targetBps * 0.02) {
-    targetBps = next;
-    window.net.setRate(next);
-    try {
-      encoder.configure(encoderConfigFor(encCandidates[encCandidateIdx], next));
-    } catch { /* keep old */ }
-    log(`Adaptivni bitrate: ${(next / 1e6).toFixed(1)} Mbps (${reason})`);
-  }
+  withPC(call, (pc) => {
+    monitorPC(pc, 'slanje');
+    startStats(pc); // live outbound stats for the sender too
+  });
+  applyQuality(call);
+  setStatus('Šaljem ekran drugaru…', 'live');
+  log(`Zovem ${id} sa mojim ekranom.`);
 }
 
-function onEncodedChunk(chunk) {
-  const data = new Uint8Array(chunk.byteLength);
-  chunk.copyTo(data);
-  const id = sendFrameId++;
-  const key = chunk.type === 'key';
-  const tsMs = Math.max(0, Math.round(chunk.timestamp / 1000)) >>> 0;
+// Override WebRTC's conservative defaults to push high quality.
+function applyQuality(call) {
+  const maxBitrate = Number(el('bitrate').value);
+  const fps = Number(el('fps').value);
+  const mode = el('mode').value;
 
-  const count = Math.ceil(data.length / FRAG_SIZE) || 1;
-  const frags = new Array(count);
-  for (let i = 0; i < count; i++) {
-    const slice = data.subarray(i * FRAG_SIZE, Math.min((i + 1) * FRAG_SIZE, data.length));
-    const pkt = new Uint8Array(14 + slice.length);
-    const dv = new DataView(pkt.buffer);
-    pkt[0] = 0; // kind: video fragment
-    dv.setUint32(1, id);
-    dv.setUint16(5, i);
-    dv.setUint16(7, count);
-    pkt[9] = key ? 1 : 0;
-    dv.setUint32(10, tsMs);
-    pkt.set(slice, 14);
-    frags[i] = pkt;
-  }
+  const tune = () => {
+    const pc = call.peerConnection;
+    if (!pc) return setTimeout(tune, 200);
+    const sender = pc.getSenders().find((s) => s.track && s.track.kind === 'video');
+    if (!sender) return setTimeout(tune, 200);
 
-  sentRing.set(id, frags);
-  if (sentRing.size > 180) {
-    const oldest = sentRing.keys().next().value;
-    sentRing.delete(oldest);
-  }
-  window.net.sendFrags(frags, false);
-  stats.outBytes += data.length;
-  stats.outFrames++;
+    const params = sender.getParameters();
+    if (!params.encodings || !params.encodings.length) params.encodings = [{}];
+    params.encodings[0].maxBitrate = maxBitrate;
+    params.encodings[0].maxFramerate = fps;
+    // Sharp text vs smooth motion trade-off when bandwidth is tight.
+    params.degradationPreference =
+      mode === 'text' ? 'maintain-resolution' : 'maintain-framerate';
+
+    sender
+      .setParameters(params)
+      .then(() => log(`Kvalitet postavljen: ${(maxBitrate / 1e6).toFixed(0)} Mbps @ ${fps}fps`))
+      .catch((e) => log('setParameters greška: ' + e.message));
+  };
+  tune();
 }
 
 function stopSharing() {
-  pumping = false;
-  if (pumpReader) { pumpReader.cancel().catch(() => {}); pumpReader = null; }
-  if (encoder) { try { encoder.close(); } catch { /* already */ } encoder = null; }
   if (localStream) {
     localStream.getTracks().forEach((t) => t.stop());
     localStream = null;
   }
-  sentRing.clear();
+  activeCalls.forEach((c, id) => {
+    if (c) c.close();
+  });
   localVideo.srcObject = null;
   pipWrap.classList.add('hidden');
   shareBtn.disabled = false;
   stopBtn.disabled = true;
-  setStatus(peerPresent ? 'Povezan — deljenje zaustavljeno' : 'Deljenje zaustavljeno', 'ready');
+  setStatus('Deljenje zaustavljeno', 'ready');
   log('Deljenje zaustavljeno.');
 }
 
 stopBtn.addEventListener('click', stopSharing);
 
-// Live bitrate/FPS changes: reconfigure the running encoder in place.
-['bitrate', 'fps'].forEach((id) => {
+// ---------------------------------------------------------------------------
+// Misc UI
+// ---------------------------------------------------------------------------
+el('copyId').addEventListener('click', () => {
+  navigator.clipboard.writeText(myIdInput.value);
+  log('Kod kopiran.');
+});
+
+remoteIdInput.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') connectBtn.click();
+});
+
+// Live-adjust bitrate/fps on already-running calls.
+['bitrate', 'fps', 'mode'].forEach((id) => {
   el(id).addEventListener('change', () => {
-    const bps = Number(el('bitrate').value);
-    window.net.setRate(bps);
-    targetBps = bps; // reset the adaptive controller to the new ceiling
-    cleanSecs = 0;
-    if (encoder && encoder.state === 'configured') {
-      try {
-        encDims.fps = Number(el('fps').value);
-        encoder.configure(encoderConfigFor(encCandidates[encCandidateIdx], bps));
-        wantKey = true;
-        log(`Bitrate promenjen: ${(bps / 1e6).toFixed(0)} Mbps`);
-      } catch (e) {
-        log('Reconfigure nije uspeo: ' + e.message);
-      }
-    }
+    activeCalls.forEach((c) => c && c.peerConnection && applyQuality(c));
   });
 });
 
 // ---------------------------------------------------------------------------
-// Receive path: reassemble -> order -> decode -> canvas
-// ---------------------------------------------------------------------------
-function onPayload(buf) {
-  if (!buf || buf.length < 1) return;
-  if (buf[0] === 0) onVideoFrag(buf);
-  else if (buf[0] === 1) onCtrl(buf);
-}
-
-function onVideoFrag(buf) {
-  if (buf.length < 14) return;
-  const dv = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
-  const frameId = dv.getUint32(1);
-  const fragIdx = dv.getUint16(5);
-  const count = dv.getUint16(7);
-  const key = buf[9] === 1;
-  const tsMs = dv.getUint32(10);
-  const payload = buf.subarray(14);
-
-  stats.inBytes += payload.length;
-  stats.inFrags++;
-  if (frameId > maxSeenFrame) maxSeenFrame = frameId;
-  if (frameId <= lastDecoded || complete.has(frameId)) return; // stale/dup
-
-  let entry = pending.get(frameId);
-  if (!entry) {
-    entry = { frags: new Array(count), got: 0, count, key, tsMs, t0: performance.now(), nacks: 0 };
-    pending.set(frameId, entry);
-  }
-  if (fragIdx < entry.count && !entry.frags[fragIdx]) {
-    entry.frags[fragIdx] = payload;
-    entry.got++;
-  }
-  if (entry.key) entry.key = entry.key || key;
-
-  if (entry.got === entry.count) {
-    pending.delete(frameId);
-    let total = 0;
-    for (const f of entry.frags) total += f.length;
-    const data = new Uint8Array(total);
-    let off = 0;
-    for (const f of entry.frags) { data.set(f, off); off += f.length; }
-    complete.set(frameId, { data, key: entry.key, tsMs: entry.tsMs, t0: entry.t0 });
-    tryDeliver();
-  }
-}
-
-function ensureDecoder() {
-  if (decoder && decoder.state === 'configured') return;
-  decoder = new VideoDecoder({
-    output: onDecodedFrame,
-    error: (e) => {
-      log('Dekoder greška: ' + e.message + ' — resetujem');
-      try { decoder.close(); } catch { /* already */ }
-      decoder = null;
-      lastDecoded = -1;
-      requestKeyframe();
-    }
-  });
-  decoder.configure({ codec: decoderCodec || 'avc1.640034', optimizeForLatency: true });
-}
-
-function tryDeliver() {
-  ensureDecoder();
-  let progressed = true;
-  while (progressed) {
-    progressed = false;
-    if (lastDecoded === -1) {
-      // Need a keyframe to start (or restart after reset).
-      let bestKey = -1;
-      for (const [id, f] of complete) if (f.key && id > bestKey) bestKey = id;
-      if (bestKey !== -1) {
-        decodeFrame(bestKey);
-        // Everything older is useless now.
-        for (const id of [...complete.keys()]) if (id < bestKey) complete.delete(id);
-        for (const id of [...pending.keys()]) if (id < bestKey) pending.delete(id);
-        progressed = true;
-      }
-    } else if (complete.has(lastDecoded + 1)) {
-      decodeFrame(lastDecoded + 1);
-      progressed = true;
-    } else {
-      // If we're stuck but a newer KEYFRAME is ready, jump to it.
-      let jump = -1;
-      for (const [id, f] of complete) if (f.key && id > lastDecoded && id > jump) jump = id;
-      if (jump !== -1 && complete.get(jump).t0 + 120 < performance.now()) {
-        for (const id of [...complete.keys()]) if (id < jump) complete.delete(id);
-        for (const id of [...pending.keys()]) if (id < jump) pending.delete(id);
-        decodeFrame(jump);
-        progressed = true;
-      }
-    }
-  }
-}
-
-function decodeFrame(id) {
-  const f = complete.get(id);
-  complete.delete(id);
-  try {
-    decoder.decode(new EncodedVideoChunk({
-      type: f.key ? 'key' : 'delta',
-      timestamp: f.tsMs * 1000,
-      data: f.data
-    }));
-    lastDecoded = id;
-  } catch (e) {
-    log('decode(): ' + e.message);
-    lastDecoded = -1;
-    requestKeyframe();
-  }
-}
-
-function onDecodedFrame(frame) {
-  if (remoteCanvas.width !== frame.displayWidth || remoteCanvas.height !== frame.displayHeight) {
-    remoteCanvas.width = frame.displayWidth;
-    remoteCanvas.height = frame.displayHeight;
-  }
-  canvasCtx.drawImage(frame, 0, 0);
-  frame.close();
-  stats.inFrames++;
-  stats.lastW = remoteCanvas.width;
-  stats.lastH = remoteCanvas.height;
-  if (!placeholder.classList.contains('hidden')) placeholder.classList.add('hidden');
-}
-
-function clearRemote() {
-  canvasCtx.clearRect(0, 0, remoteCanvas.width, remoteCanvas.height);
-  placeholder.classList.remove('hidden');
-  pending.clear();
-  complete.clear();
-  lastDecoded = -1;
-  maxSeenFrame = -1;
-}
-
-// ---------------------------------------------------------------------------
-// Loss recovery: fragment NACKs, then keyframe request as the big hammer
-// ---------------------------------------------------------------------------
-setInterval(() => {
-  const now = performance.now();
-  // Thresholds must exceed RTT + pacing jitter, otherwise we NACK packets
-  // that are still in flight and flood the link with pointless retransmits.
-  const rtt = e2eRtt || 80;
-  const suspectAge = Math.max(90, rtt * 1.5 + 40);
-  const renackGap = Math.max(70, rtt);
-  for (const [id, entry] of pending) {
-    const age = now - entry.t0;
-    const newerArrived = id < maxSeenFrame;
-    if (!(newerArrived && age > suspectAge * 0.6) && age < suspectAge) continue;
-    if (entry.lastNack && now - entry.lastNack < renackGap) continue;
-    if (entry.nacks >= 3) {
-      pending.delete(id);
-      requestKeyframe();
-      continue;
-    }
-    const missing = [];
-    for (let i = 0; i < entry.count && missing.length < 200; i++) {
-      if (!entry.frags[i]) missing.push(i);
-    }
-    if (!missing.length) continue;
-    entry.nacks++;
-    entry.lastNack = now;
-    stats.nacksSent += missing.length;
-    const b = new Uint8Array(8 + missing.length * 2);
-    const dv = new DataView(b.buffer);
-    b[0] = 1; b[1] = 1; // ctrl: NACK
-    dv.setUint32(2, id);
-    dv.setUint16(6, missing.length);
-    missing.forEach((m, i) => dv.setUint16(8 + i * 2, m));
-    window.net.sendFrags([b], 'ctrl');
-  }
-  // Hard stall: nothing decoded recently while data flows -> keyframe.
-  if (lastDecoded !== -1 && maxSeenFrame > lastDecoded + 60) requestKeyframe();
-}, 30);
-
-let lastKeyReq = 0;
-function requestKeyframe() {
-  const now = performance.now();
-  if (now - lastKeyReq < 1000) return;
-  lastKeyReq = now;
-  window.net.sendFrags([new Uint8Array([1, 2])], 'ctrl');
-}
-
-function onCtrl(buf) {
-  const dv = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
-  switch (buf[1]) {
-    case 1: { // NACK -> retransmit from ring (metered: front of the paced queue)
-      if (buf.length < 8) return;
-      const frameId = dv.getUint32(2);
-      const n = dv.getUint16(6);
-      const frags = sentRing.get(frameId);
-      if (!frags) return;
-      const out = [];
-      for (let i = 0; i < n && 8 + i * 2 + 2 <= buf.length; i++) {
-        const idx = dv.getUint16(8 + i * 2);
-        if (frags[idx]) out.push(frags[idx]);
-      }
-      if (out.length) {
-        stats.retx += out.length;
-        window.net.sendFrags(out, 'front');
-      }
-      break;
-    }
-    case 2: // keyframe request
-      wantKey = true;
-      break;
-    case 3: { // e2e ping -> echo as pong
-      const echo = new Uint8Array(buf);
-      echo[1] = 4;
-      window.net.sendFrags([echo], 'ctrl');
-      break;
-    }
-    case 4: // e2e pong
-      if (buf.length >= 10) e2eRtt = Math.round(performance.now() - dv.getFloat64(2));
-      break;
-    case 6: // remote loss report (their receive loss of OUR stream)
-      if (buf.length >= 3) lastRemoteLoss = Math.max(lastRemoteLoss, buf[2]);
-      break;
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Stats HUD (1s)
-// ---------------------------------------------------------------------------
-setInterval(() => {
-  const inMbps = (stats.inBytes * 8 / 1e6).toFixed(1);
-  const outMbps = (stats.outBytes * 8 / 1e6).toFixed(1);
-  const parts = [];
-  if (stats.inFrames > 0) {
-    parts.push(`⇣ gledaš ${stats.lastW}×${stats.lastH} @ ${stats.inFrames}fps · ${inMbps} Mbps`);
-  }
-  if (stats.outFrames > 0) {
-    const tgt = targetBps ? ` (cilj ${(targetBps / 1e6).toFixed(1)})` : '';
-    parts.push(`⇡ šalješ ${encDims.w}×${encDims.h} @ ${stats.outFrames}fps · ${outMbps}${tgt} Mbps`);
-  }
-  // Report OUR receive loss to the sender (feeds their adaptive controller).
-  if (peerPresent && (stats.inFrags > 0 || stats.nacksSent > 0)) {
-    const denom = stats.inFrags + stats.nacksSent;
-    const pct = denom ? Math.min(100, Math.round((stats.nacksSent / denom) * 100)) : 0;
-    window.net.sendFrags([new Uint8Array([1, 6, pct])], 'ctrl');
-  }
-  adaptTick();
-  // Encoder starvation diagnostics: if we skip frames, the encoder can't keep
-  // up (usually = software fallback) — say it out loud instead of just lagging.
-  if (pumping && skipCount > encCount && skipCount > 10) {
-    log(`⚠ Enkoder guši: ${skipCount} preskočenih / ${encCount} enkodiranih frejmova u poslednjoj sekundi`);
-  }
-  skipCount = 0;
-  encCount = 0;
-  if (parts.length) {
-    const extra = e2eRtt ? ` · ping ${e2eRtt}ms` : '';
-    const lossTxt = stats.nacksSent ? ` · retx ${stats.nacksSent}` : '';
-    setStatus(parts.join(' | ') + extra + lossTxt, 'live');
-  }
-  stats.inBytes = stats.outBytes = 0;
-  stats.inFrames = stats.outFrames = 0;
-  stats.inFrags = 0;
-  stats.nacksSent = 0;
-
-  // GC stale partial frames (>2s old).
-  const now = performance.now();
-  for (const [id, e] of pending) if (now - e.t0 > 2000) pending.delete(id);
-  for (const [id, f] of complete) if (now - f.t0 > 2000) complete.delete(id);
-}, 1000);
-
-// ---------------------------------------------------------------------------
-initNet();
+initPeer();

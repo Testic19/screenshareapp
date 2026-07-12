@@ -1,6 +1,6 @@
 {
   "name": "screenshare-p2p",
-  "version": "0.2.2",
+  "version": "0.3.0",
   "description": "High-quality peer-to-peer screen sharing for Windows and macOS",
   "main": "src/main.js",
   "author": {
