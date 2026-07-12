@@ -3,7 +3,10 @@
   "version": "0.1.0",
   "description": "High-quality peer-to-peer screen sharing for Windows and macOS",
   "main": "src/main.js",
-  "author": "",
+  "author": {
+    "name": "Mihajlo",
+    "email": "mihajlojovcic06@gmail.com"
+  },
   "license": "MIT",
   "scripts": {
     "start": "electron .",
