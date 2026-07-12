@@ -43,11 +43,19 @@ func main() {
 		userKeys[name] = turn.GenerateAuthKey(name, cfg.Realm, pass)
 	}
 
+	// Self-test: how many relay ports can we actually bind? On Pterodactyl the
+	// container can only bind ALLOCATED ports, so this instantly reveals a
+	// misconfigured range (the usual cause of "max retries exceeded").
+	checkRelayPorts(cfg.MinPort, cfg.MaxPort)
+
 	relayGen := &turn.RelayAddressGeneratorPortRange{
 		RelayAddress: net.ParseIP(cfg.PublicIP),
 		Address:      "0.0.0.0",
 		MinPort:      cfg.MinPort,
 		MaxPort:      cfg.MaxPort,
+		// High retry count so allocation still finds a free/bindable port even
+		// when only a few ports in the range are usable.
+		MaxRetries: 100,
 	}
 
 	var packetConns []turn.PacketConnConfig
@@ -165,6 +173,30 @@ func printBanner(c config) {
 	fmt.Printf("{ urls: 'turn:%s:%d?transport=tcp', username: '%s', credential: '%s' },\n", c.PublicIP, c.Port, user, pass)
 	fmt.Println("===========================================================")
 	fmt.Println()
+}
+
+// checkRelayPorts tries to bind every UDP port in the range and reports how
+// many succeed. On Pterodactyl an unallocated port cannot be bound, so a low
+// count means you must allocate more (contiguous) ports and match the range.
+func checkRelayPorts(min, max uint16) {
+	ok := 0
+	var bad []uint16
+	for p := int(min); p <= int(max); p++ {
+		conn, err := net.ListenPacket("udp4", fmt.Sprintf("0.0.0.0:%d", p))
+		if err != nil {
+			bad = append(bad, uint16(p))
+			continue
+		}
+		_ = conn.Close()
+		ok++
+	}
+	total := int(max-min) + 1
+	log.Printf("relay portovi bindable: %d/%d", ok, total)
+	if ok == 0 {
+		log.Printf("KRITIČNO: nijedan relay port se ne može vezati — alociraj opseg u Ptero i podesi TURN_MIN_PORT/TURN_MAX_PORT na te portove!")
+	} else if len(bad) > 0 {
+		log.Printf("upozorenje: %d portova nije bindable (nisu alocirani u Ptero?): %v", len(bad), bad)
+	}
 }
 
 func tcpNote(enabled bool) string {

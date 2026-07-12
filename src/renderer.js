@@ -63,8 +63,9 @@ function initPeer() {
         { urls: 'stun:40.160.64.73:56969' },
         { urls: 'turn:40.160.64.73:56969?transport=udp', username: 'pera', credential: 'promeniMe123' },
         { urls: 'turn:40.160.64.73:56969?transport=tcp', username: 'pera', credential: 'promeniMe123' }
-      ],
-      iceCandidatePoolSize: 4
+      ]
+      // NB: no iceCandidatePoolSize — pooling would pre-open several TURN
+      // allocations per connection and exhaust the relay port range.
     }
   });
 
