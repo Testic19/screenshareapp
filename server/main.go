@@ -16,7 +16,9 @@ import (
 	"os/signal"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
+	"time"
 
 	"github.com/pion/turn/v4"
 )
@@ -67,8 +69,15 @@ func main() {
 		log.Fatalf("ne mogu da slušam UDP na %d: %v", cfg.Port, err)
 	}
 	tuneUDPBuffers(udpConn)
+
+	// Custom ScreenShare forwarder protocol, multiplexed on the SAME UDP port
+	// (all its packets start with the 0xC5 magic byte, which never collides
+	// with STUN/TURN). One port, zero relay-port allocations needed.
+	fw := newForwarder(udpConn, cfg.Users)
+	muxed := &muxConn{PacketConn: udpConn, handle: fw.handle}
+
 	packetConns = append(packetConns, turn.PacketConnConfig{
-		PacketConn:            udpConn,
+		PacketConn:            muxed,
 		RelayAddressGenerator: relayGen,
 	})
 
@@ -159,6 +168,7 @@ func loadConfig() config {
 // printBanner logs a ready-to-paste ICE config for the app.
 func printBanner(c config) {
 	log.Printf("TURN server sluša na 0.0.0.0:%d (UDP%s)", c.Port, tcpNote(c.EnableTCP))
+	log.Printf("FORWARDER (novi protokol) aktivan na istom UDP portu %d — bez relay portova", c.Port)
 	log.Printf("javna IP: %s | realm: %s | relay portovi: %d-%d", c.PublicIP, c.Realm, c.MinPort, c.MaxPort)
 	log.Printf("korisnika: %d", len(c.Users))
 
@@ -174,6 +184,242 @@ func printBanner(c config) {
 	fmt.Printf("{ urls: 'turn:%s:%d?transport=tcp', username: '%s', credential: '%s' },\n", c.PublicIP, c.Port, user, pass)
 	fmt.Println("===========================================================")
 	fmt.Println()
+}
+
+// ---------------------------------------------------------------------------
+// ScreenShare forwarder — a dumb, fast pairing relay for the app's custom
+// (non-WebRTC) media protocol. Two clients register into a "room" (the code
+// the users exchange); every DATA packet from one is forwarded verbatim to
+// the other. The server never parses media. Runs on the SAME UDP socket as
+// TURN via muxConn (magic byte 0xC5).
+//
+// Wire format (client<->server):
+//   [0xC5][0x01] REG   : u8 ulen, user, u8 plen, pass, u8 rlen, room
+//   [0xC5][0x02] REGOK : u8 otherPeerPresent (server->client)
+//   [0xC5][0x03] PEER_JOINED (server->client)
+//   [0xC5][0x04] PEER_LEFT   (server->client)
+//   [0xC5][0x10] DATA  : opaque payload, forwarded to the room's other peer
+//   [0xC5][0x20] PING  : 8B opaque -> echoed back as [0xC5][0x21] PONG
+// ---------------------------------------------------------------------------
+
+const fwdMagic = 0xC5
+
+type fwdSlot struct {
+	addr net.Addr
+	key  string
+	last time.Time
+}
+
+type fwdRoom struct {
+	peers [2]*fwdSlot
+}
+
+type forwarder struct {
+	mu     sync.Mutex
+	conn   net.PacketConn
+	users  map[string]string
+	rooms  map[string]*fwdRoom
+	byAddr map[string]*fwdRef
+}
+
+type fwdRef struct {
+	roomID string
+	idx    int
+}
+
+func newForwarder(conn net.PacketConn, users map[string]string) *forwarder {
+	f := &forwarder{
+		conn:   conn,
+		users:  users,
+		rooms:  map[string]*fwdRoom{},
+		byAddr: map[string]*fwdRef{},
+	}
+	go f.sweep()
+	return f
+}
+
+// handle consumes one 0xC5 packet. Called inline from the mux read loop, so
+// it must stay fast: map lookups + a single WriteTo.
+func (f *forwarder) handle(p []byte, addr net.Addr) {
+	if len(p) < 2 {
+		return
+	}
+	switch p[1] {
+	case 0x01:
+		f.register(p[2:], addr)
+	case 0x10:
+		f.forward(p, addr)
+	case 0x20:
+		out := make([]byte, len(p))
+		copy(out, p)
+		out[1] = 0x21
+		_, _ = f.conn.WriteTo(out, addr)
+	}
+}
+
+func (f *forwarder) register(p []byte, addr net.Addr) {
+	readStr := func(b []byte) (string, []byte, bool) {
+		if len(b) < 1 || len(b) < 1+int(b[0]) {
+			return "", nil, false
+		}
+		return string(b[1 : 1+b[0]]), b[1+b[0]:], true
+	}
+	user, rest, ok := readStr(p)
+	if !ok {
+		return
+	}
+	pass, rest, ok := readStr(rest)
+	if !ok {
+		return
+	}
+	roomID, _, ok := readStr(rest)
+	if !ok || roomID == "" {
+		return
+	}
+	if want, exists := f.users[user]; !exists || want != pass {
+		log.Printf("fwd: odbijen REG (los kredencijal) sa %s", addr)
+		return
+	}
+
+	key := addr.String()
+	now := time.Now()
+
+	f.mu.Lock()
+	// Leave any previous room this address occupied.
+	if ref, ok := f.byAddr[key]; ok && ref.roomID != roomID {
+		f.leaveLocked(key, ref)
+	}
+	room := f.rooms[roomID]
+	if room == nil {
+		room = &fwdRoom{}
+		f.rooms[roomID] = room
+	}
+	// Refresh existing slot, or take a free/stale one.
+	idx := -1
+	for i, s := range room.peers {
+		if s != nil && s.key == key {
+			idx = i
+			break
+		}
+	}
+	if idx == -1 {
+		for i, s := range room.peers {
+			if s == nil || now.Sub(s.last) > 15*time.Second {
+				if s != nil {
+					delete(f.byAddr, s.key)
+				}
+				idx = i
+				break
+			}
+		}
+	}
+	if idx == -1 {
+		f.mu.Unlock()
+		log.Printf("fwd: soba %q puna, odbijen %s", roomID, addr)
+		return
+	}
+	isNew := room.peers[idx] == nil || room.peers[idx].key != key
+	room.peers[idx] = &fwdSlot{addr: addr, key: key, last: now}
+	f.byAddr[key] = &fwdRef{roomID: roomID, idx: idx}
+
+	other := room.peers[1-idx]
+	otherLive := other != nil && now.Sub(other.last) <= 15*time.Second
+	f.mu.Unlock()
+
+	present := byte(0)
+	if otherLive {
+		present = 1
+	}
+	_, _ = f.conn.WriteTo([]byte{fwdMagic, 0x02, present}, addr)
+	if isNew && otherLive {
+		_, _ = f.conn.WriteTo([]byte{fwdMagic, 0x03}, addr)
+		_, _ = f.conn.WriteTo([]byte{fwdMagic, 0x03}, other.addr)
+		log.Printf("fwd: soba %q uparena (%s <-> %s)", roomID, addr, other.addr)
+	}
+}
+
+func (f *forwarder) forward(p []byte, addr net.Addr) {
+	key := addr.String()
+	f.mu.Lock()
+	ref, ok := f.byAddr[key]
+	if !ok {
+		f.mu.Unlock()
+		return
+	}
+	room := f.rooms[ref.roomID]
+	if room == nil {
+		f.mu.Unlock()
+		return
+	}
+	if self := room.peers[ref.idx]; self != nil {
+		self.last = time.Now()
+	}
+	other := room.peers[1-ref.idx]
+	var dst net.Addr
+	if other != nil {
+		dst = other.addr
+	}
+	f.mu.Unlock()
+
+	if dst != nil {
+		_, _ = f.conn.WriteTo(p, dst)
+	}
+}
+
+func (f *forwarder) leaveLocked(key string, ref *fwdRef) {
+	if room := f.rooms[ref.roomID]; room != nil {
+		if s := room.peers[ref.idx]; s != nil && s.key == key {
+			room.peers[ref.idx] = nil
+			if other := room.peers[1-ref.idx]; other != nil {
+				_, _ = f.conn.WriteTo([]byte{fwdMagic, 0x04}, other.addr)
+			}
+		}
+		if room.peers[0] == nil && room.peers[1] == nil {
+			delete(f.rooms, ref.roomID)
+		}
+	}
+	delete(f.byAddr, key)
+}
+
+func (f *forwarder) sweep() {
+	for range time.Tick(5 * time.Second) {
+		now := time.Now()
+		f.mu.Lock()
+		for key, ref := range f.byAddr {
+			room := f.rooms[ref.roomID]
+			if room == nil {
+				delete(f.byAddr, key)
+				continue
+			}
+			if s := room.peers[ref.idx]; s == nil || s.key != key || now.Sub(s.last) > 15*time.Second {
+				f.leaveLocked(key, ref)
+			}
+		}
+		f.mu.Unlock()
+	}
+}
+
+// muxConn splits one UDP socket between the forwarder (0xC5 packets, consumed
+// inline) and TURN/STUN (everything else, passed to pion).
+type muxConn struct {
+	net.PacketConn
+	handle func(p []byte, addr net.Addr)
+}
+
+func (m *muxConn) ReadFrom(p []byte) (int, net.Addr, error) {
+	for {
+		n, addr, err := m.PacketConn.ReadFrom(p)
+		if err != nil {
+			return n, addr, err
+		}
+		if n > 0 && p[0] == fwdMagic {
+			buf := make([]byte, n)
+			copy(buf, p[:n])
+			m.handle(buf, addr)
+			continue
+		}
+		return n, addr, err
+	}
 }
 
 // loggingGenerator wraps the port-range generator to log every relay
