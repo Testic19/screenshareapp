@@ -101,20 +101,26 @@ function netStart(cfg) {
     sock.send(ping, serverPort, serverHost);
   }, 2000);
 
-  // Pacer: drain the queues on a 3ms tick with a byte budget derived from the
-  // configured bitrate (x1.7 headroom so NACK retransmits fit too).
+  // Pacer: drain the queues with a byte budget derived from the configured
+  // bitrate (x1.7 headroom so NACK retransmits fit). The budget scales with
+  // the REAL elapsed time between ticks — setInterval jitter (common on
+  // Windows) then can't silently throttle throughput.
   let carry = 0;
+  let lastTick = Date.now();
   paceTimer = setInterval(() => {
     if (!sock) return;
+    const now = Date.now();
+    const dt = Math.min(0.05, (now - lastTick) / 1000); // cap burst at 50ms worth
+    lastTick = now;
     while (ctrlQ.length) sock.send(ctrlQ.shift(), serverPort, serverHost);
-    let budget = (rateBps * 1.7 * 0.003) / 8 + carry;
+    let budget = (rateBps * 1.7 * dt) / 8 + carry;
     while (dataQ.length && budget >= dataQ[0].length) {
       const pkt = dataQ.shift();
       budget -= pkt.length;
       sock.send(pkt, serverPort, serverHost);
     }
     // Cap leftover budget so idle periods can't bank an unlimited burst.
-    carry = Math.min(budget, 32 * 1024);
+    carry = Math.min(budget, 64 * 1024);
     // Safety valve: if the queue backs up past ~1s of data, drop oldest.
     const maxQ = (rateBps / 8) | 0;
     let qBytes = 0;
@@ -151,13 +157,15 @@ ipcMain.on('net-rate', (e, bps) => {
 });
 
 // frags: array of Uint8Array (media or ctrl payloads). Wrapped as DATA here.
-ipcMain.on('net-frags', (e, frags, priority) => {
+// mode: 'ctrl' = tiny control msgs (sent immediately, unmetered),
+//       'front' = retransmits (metered, but jump the queue),
+//       default = media (metered, FIFO).
+ipcMain.on('net-frags', (e, frags, mode) => {
   if (!sock) return;
-  for (const f of frags) {
-    const pkt = Buffer.concat([Buffer.from([MAGIC, 0x10]), Buffer.from(f)]);
-    if (priority) ctrlQ.push(pkt);
-    else dataQ.push(pkt);
-  }
+  const pkts = frags.map((f) => Buffer.concat([Buffer.from([MAGIC, 0x10]), Buffer.from(f)]));
+  if (mode === 'ctrl') ctrlQ.push(...pkts);
+  else if (mode === 'front') dataQ.unshift(...pkts);
+  else dataQ.push(...pkts);
 });
 
 // ---------------------------------------------------------------------------

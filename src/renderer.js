@@ -101,7 +101,7 @@ async function initNet() {
     const b = new Uint8Array(10);
     b[0] = 1; b[1] = 3;
     new DataView(b.buffer).setFloat64(2, performance.now());
-    window.net.sendFrags([b], true);
+    window.net.sendFrags([b], 'ctrl');
   }, 2000);
 }
 
@@ -177,18 +177,19 @@ shareBtn.addEventListener('click', async () => {
 el('pickerClose').addEventListener('click', () => picker.classList.add('hidden'));
 
 async function startCapture(sourceId) {
-  const [w, h] = el('res').value.split('x').map(Number);
+  // The resolution preset is a HEIGHT cap; width follows the source's native
+  // aspect ratio (ultrawide stays ultrawide — no stretching).
+  const presetH = Number(el('res').value.split('x')[1]);
   const fps = Number(el('fps').value);
 
   try {
+    // Capture at NATIVE size first (no width/height constraints).
     const stream = await navigator.mediaDevices.getUserMedia({
       audio: false,
       video: {
         mandatory: {
           chromeMediaSource: 'desktop',
           chromeMediaSourceId: sourceId,
-          maxWidth: w,
-          maxHeight: h,
           maxFrameRate: fps
         }
       }
@@ -202,63 +203,90 @@ async function startCapture(sourceId) {
     stopBtn.disabled = false;
 
     const track = stream.getVideoTracks()[0];
-    const st = track.getSettings();
-    log(`Hvatam: ${st.width}x${st.height} @ ${Math.round(st.frameRate) || fps}fps`);
+    let st = track.getSettings();
+    const natW = st.width, natH = st.height;
+    log(`Izvor: ${natW}x${natH} (ratio ${(natW / natH).toFixed(2)})`);
+
+    // Scale down to the preset height, keep ratio, force EVEN dimensions
+    // (H.264 hardware encoders reject odd sizes).
+    const even = (n) => Math.max(2, Math.round(n / 2) * 2);
+    let encH = Math.min(presetH, natH);
+    let encW = even(encH * (natW / natH));
+    encH = even(encH);
+    if (encW !== natW || encH !== natH) {
+      try {
+        await track.applyConstraints({ width: encW, height: encH, frameRate: fps });
+        st = track.getSettings();
+        encW = even(st.width || encW);
+        encH = even(st.height || encH);
+      } catch (e) {
+        log('Skaliranje nije uspelo (' + e.message + ') — šaljem native.');
+        encW = even(natW);
+        encH = even(natH);
+      }
+    }
+    log(`Enkodiram: ${encW}x${encH} @ ${fps}fps`);
     track.addEventListener('ended', stopSharing);
 
-    await startEncoder(track, st.width || w, st.height || h, fps);
+    await startEncoder(track, encW, encH, fps);
   } catch (e) {
     log('Greška pri hvatanju ekrana: ' + e.message);
     setStatus('Greška pri hvatanju ekrana', 'error');
   }
 }
 
+let encCandidates = [];
+let encCandidateIdx = 0;
+let encDims = { w: 0, h: 0, fps: 60 };
+let lastKeyTime = 0;
+let skipCount = 0;
+let encCount = 0;
+
+function encoderConfigFor(c, bps) {
+  return {
+    codec: c.codec,
+    hardwareAcceleration: c.hardwareAcceleration,
+    width: encDims.w,
+    height: encDims.h,
+    framerate: encDims.fps,
+    bitrate: bps,
+    bitrateMode: 'constant',
+    latencyMode: 'realtime',
+    avc: { format: 'annexb' }
+  };
+}
+
 async function startEncoder(track, w, h, fps) {
   const bps = Number(el('bitrate').value);
   window.net.setRate(bps);
+  encDims = { w, h, fps };
 
   // Hardware H.264 first; software fallbacks after. High profile level 5.2
-  // covers 4K60.
-  const candidates = [
+  // covers 4K60 (and ultrawide widths).
+  const all = [
     { codec: 'avc1.640034', hardwareAcceleration: 'prefer-hardware' },
     { codec: 'avc1.64002A', hardwareAcceleration: 'prefer-hardware' },
     { codec: 'avc1.640034', hardwareAcceleration: 'no-preference' },
     { codec: 'avc1.42E034', hardwareAcceleration: 'no-preference' }
   ];
-
-  let chosen = null;
-  for (const c of candidates) {
-    const cfg = {
-      codec: c.codec,
-      hardwareAcceleration: c.hardwareAcceleration,
-      width: w,
-      height: h,
-      framerate: fps,
-      bitrate: bps,
-      bitrateMode: 'constant',
-      latencyMode: 'realtime',
-      avc: { format: 'annexb' }
-    };
+  encCandidates = [];
+  for (const c of all) {
     try {
-      const sup = await VideoEncoder.isConfigSupported(cfg);
-      if (sup.supported) { chosen = cfg; break; }
-    } catch { /* try next */ }
+      const sup = await VideoEncoder.isConfigSupported(encoderConfigFor(c, bps));
+      if (sup.supported) encCandidates.push(c);
+    } catch { /* skip */ }
   }
-  if (!chosen) {
+  if (!encCandidates.length) {
     log('GREŠKA: nijedan H.264 enkoder nije podržan?!');
     setStatus('Enkoder nedostupan', 'error');
     return;
   }
-
-  encoder = new VideoEncoder({
-    output: onEncodedChunk,
-    error: (e) => log('Enkoder greška: ' + e.message)
-  });
-  encoder.configure(chosen);
-  decoderCodec = chosen.codec;
-  log(`Enkoder: ${chosen.codec} (${chosen.hardwareAcceleration}) · CBR ${(bps / 1e6).toFixed(0)} Mbps`);
+  encCandidateIdx = 0;
+  buildEncoder(bps);
 
   pumping = true;
+  skipCount = 0;
+  encCount = 0;
   const processor = new MediaStreamTrackProcessor({ track });
   pumpReader = processor.readable.getReader();
   (async () => {
@@ -266,16 +294,43 @@ async function startEncoder(track, w, h, fps) {
       const { value: frame, done } = await pumpReader.read().catch(() => ({ done: true }));
       if (done || !frame) break;
       if (peerPresent && encoder && encoder.state === 'configured' && encoder.encodeQueueSize <= 2) {
-        const kf = wantKey || frameCounter % (Number(el('fps').value) * 5) === 0;
-        wantKey = false;
-        try { encoder.encode(frame, { keyFrame: kf }); } catch { /* closing */ }
+        const now = performance.now();
+        const periodic = frameCounter % (encDims.fps * 4) === 0;
+        const kf = periodic || (wantKey && now - lastKeyTime > 300);
+        if (kf) { wantKey = false; lastKeyTime = now; }
+        try { encoder.encode(frame, { keyFrame: kf }); encCount++; } catch { /* closing */ }
         frameCounter++;
+      } else if (peerPresent) {
+        skipCount++; // encoder busy -> frame dropped (visible in diagnostics)
       }
       frame.close();
     }
   })();
 
   setStatus('UŽIVO — šaljem (čekam statistiku…)', 'live');
+}
+
+function buildEncoder(bps) {
+  const c = encCandidates[encCandidateIdx];
+  encoder = new VideoEncoder({
+    output: onEncodedChunk,
+    error: (e) => {
+      log(`Enkoder pao (${c.codec}/${c.hardwareAcceleration}): ${e.message}`);
+      try { encoder.close(); } catch { /* already */ }
+      // Auto-fallback to the next candidate (e.g. software) so sharing survives.
+      if (encCandidateIdx + 1 < encCandidates.length && pumping) {
+        encCandidateIdx++;
+        log('Prebacujem na sledeći enkoder…');
+        buildEncoder(Number(el('bitrate').value));
+      } else {
+        setStatus('Enkoder otkazao', 'error');
+      }
+    }
+  });
+  encoder.configure(encoderConfigFor(c, bps));
+  decoderCodec = c.codec;
+  wantKey = true;
+  log(`Enkoder: ${c.codec} (${c.hardwareAcceleration}) · CBR ${(bps / 1e6).toFixed(0)} Mbps · ${encDims.w}x${encDims.h}`);
 }
 
 function onEncodedChunk(chunk) {
@@ -337,16 +392,8 @@ stopBtn.addEventListener('click', stopSharing);
     window.net.setRate(bps);
     if (encoder && encoder.state === 'configured') {
       try {
-        encoder.configure({
-          codec: decoderCodec,
-          width: localStream.getVideoTracks()[0].getSettings().width,
-          height: localStream.getVideoTracks()[0].getSettings().height,
-          framerate: Number(el('fps').value),
-          bitrate: bps,
-          bitrateMode: 'constant',
-          latencyMode: 'realtime',
-          avc: { format: 'annexb' }
-        });
+        encDims.fps = Number(el('fps').value);
+        encoder.configure(encoderConfigFor(encCandidates[encCandidateIdx], bps));
         wantKey = true;
         log(`CBR promenjen: ${(bps / 1e6).toFixed(0)} Mbps`);
       } catch (e) {
@@ -494,11 +541,17 @@ function clearRemote() {
 // ---------------------------------------------------------------------------
 setInterval(() => {
   const now = performance.now();
+  // Thresholds must exceed RTT + pacing jitter, otherwise we NACK packets
+  // that are still in flight and flood the link with pointless retransmits.
+  const rtt = e2eRtt || 80;
+  const suspectAge = Math.max(90, rtt * 1.5 + 40);
+  const renackGap = Math.max(70, rtt);
   for (const [id, entry] of pending) {
-    // A frame is "suspect" once newer packets exist or it's simply old.
-    const suspect = id < maxSeenFrame || now - entry.t0 > 40;
-    if (!suspect || now - entry.t0 < 25) continue;
-    if (entry.nacks >= 4) {
+    const age = now - entry.t0;
+    const newerArrived = id < maxSeenFrame;
+    if (!(newerArrived && age > suspectAge * 0.6) && age < suspectAge) continue;
+    if (entry.lastNack && now - entry.lastNack < renackGap) continue;
+    if (entry.nacks >= 3) {
       pending.delete(id);
       requestKeyframe();
       continue;
@@ -509,6 +562,7 @@ setInterval(() => {
     }
     if (!missing.length) continue;
     entry.nacks++;
+    entry.lastNack = now;
     stats.nacksSent += missing.length;
     const b = new Uint8Array(8 + missing.length * 2);
     const dv = new DataView(b.buffer);
@@ -516,24 +570,24 @@ setInterval(() => {
     dv.setUint32(2, id);
     dv.setUint16(6, missing.length);
     missing.forEach((m, i) => dv.setUint16(8 + i * 2, m));
-    window.net.sendFrags([b], true);
+    window.net.sendFrags([b], 'ctrl');
   }
   // Hard stall: nothing decoded recently while data flows -> keyframe.
-  if (lastDecoded !== -1 && maxSeenFrame > lastDecoded + 30) requestKeyframe();
+  if (lastDecoded !== -1 && maxSeenFrame > lastDecoded + 60) requestKeyframe();
 }, 30);
 
 let lastKeyReq = 0;
 function requestKeyframe() {
   const now = performance.now();
-  if (now - lastKeyReq < 400) return;
+  if (now - lastKeyReq < 1000) return;
   lastKeyReq = now;
-  window.net.sendFrags([new Uint8Array([1, 2])], true);
+  window.net.sendFrags([new Uint8Array([1, 2])], 'ctrl');
 }
 
 function onCtrl(buf) {
   const dv = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
   switch (buf[1]) {
-    case 1: { // NACK -> retransmit from ring
+    case 1: { // NACK -> retransmit from ring (metered: front of the paced queue)
       if (buf.length < 8) return;
       const frameId = dv.getUint32(2);
       const n = dv.getUint16(6);
@@ -546,7 +600,7 @@ function onCtrl(buf) {
       }
       if (out.length) {
         stats.retx += out.length;
-        window.net.sendFrags(out, true);
+        window.net.sendFrags(out, 'front');
       }
       break;
     }
@@ -556,7 +610,7 @@ function onCtrl(buf) {
     case 3: { // e2e ping -> echo as pong
       const echo = new Uint8Array(buf);
       echo[1] = 4;
-      window.net.sendFrags([echo], true);
+      window.net.sendFrags([echo], 'ctrl');
       break;
     }
     case 4: // e2e pong
@@ -576,8 +630,15 @@ setInterval(() => {
     parts.push(`⇣ gledaš ${stats.lastW}×${stats.lastH} @ ${stats.inFrames}fps · ${inMbps} Mbps`);
   }
   if (stats.outFrames > 0) {
-    parts.push(`⇡ šalješ @ ${stats.outFrames}fps · ${outMbps} Mbps`);
+    parts.push(`⇡ šalješ ${encDims.w}×${encDims.h} @ ${stats.outFrames}fps · ${outMbps} Mbps`);
   }
+  // Encoder starvation diagnostics: if we skip frames, the encoder can't keep
+  // up (usually = software fallback) — say it out loud instead of just lagging.
+  if (pumping && skipCount > encCount && skipCount > 10) {
+    log(`⚠ Enkoder guši: ${skipCount} preskočenih / ${encCount} enkodiranih frejmova u poslednjoj sekundi`);
+  }
+  skipCount = 0;
+  encCount = 0;
   if (parts.length) {
     const extra = e2eRtt ? ` · ping ${e2eRtt}ms` : '';
     const lossTxt = stats.nacksSent ? ` · retx ${stats.nacksSent}` : '';
