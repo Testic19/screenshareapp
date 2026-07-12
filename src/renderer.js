@@ -54,14 +54,15 @@ function initPeer() {
   peer = new Peer(id, {
     debug: 1,
     config: {
-      // Clean STUN-only set. Dead TURN entries were stalling ICE in "checking"
-      // and dragging it to "disconnected". Give the direct path a clean shot.
+      // Google STUN first (tries a free DIRECT connection for best quality),
+      // then OUR own TURN relay (Pterodactyl) as the guaranteed fallback.
       iceServers: [
         { urls: 'stun:stun.l.google.com:19302' },
         { urls: 'stun:stun1.l.google.com:19302' },
-        { urls: 'stun:stun2.l.google.com:19302' },
-        { urls: 'stun:stun3.l.google.com:19302' },
-        { urls: 'stun:stun.cloudflare.com:3478' }
+        // --- Naš server (screenshare-turn na Pterodactylu) ---
+        { urls: 'stun:40.160.64.73:56969' },
+        { urls: 'turn:40.160.64.73:56969?transport=udp', username: 'pera', credential: 'promeniMe123' },
+        { urls: 'turn:40.160.64.73:56969?transport=tcp', username: 'pera', credential: 'promeniMe123' }
       ],
       iceCandidatePoolSize: 4
     }
