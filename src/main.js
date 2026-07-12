@@ -2,6 +2,10 @@ const { app, BrowserWindow, ipcMain, desktopCapturer, session } = require('elect
 const dgram = require('dgram');
 const path = require('path');
 
+// Unlock hardware video encoding on GPUs that Chromium's blocklist would
+// otherwise force to software (the #1 cause of choppy 60fps capture).
+app.commandLine.appendSwitch('ignore-gpu-blocklist');
+
 let win = null;
 
 // ---------------------------------------------------------------------------
@@ -113,7 +117,9 @@ function netStart(cfg) {
     const dt = Math.min(0.05, (now - lastTick) / 1000); // cap burst at 50ms worth
     lastTick = now;
     while (ctrlQ.length) sock.send(ctrlQ.shift(), serverPort, serverHost);
-    let budget = (rateBps * 1.7 * dt) / 8 + carry;
+    // Modest 1.2x headroom: enough for retransmits, but can't quietly push a
+    // 15 Mbps target to 25+ and drown a 20 Mbps uplink (bufferbloat).
+    let budget = (rateBps * 1.2 * dt) / 8 + carry;
     while (dataQ.length && budget >= dataQ[0].length) {
       const pkt = dataQ.shift();
       budget -= pkt.length;
@@ -189,6 +195,16 @@ function createWindow() {
   win.setMenuBarVisibility(false);
   win.loadFile(path.join(__dirname, 'index.html'));
 }
+
+// GPU diagnostics — the app log shows whether video encode is hardware.
+ipcMain.handle('gpu-status', () => {
+  try {
+    const st = app.getGPUFeatureStatus();
+    return { encode: st.video_encode, compositing: st.gpu_compositing };
+  } catch (e) {
+    return { encode: 'unknown', compositing: String(e) };
+  }
+});
 
 ipcMain.handle('get-sources', async () => {
   const sources = await desktopCapturer.getSources({

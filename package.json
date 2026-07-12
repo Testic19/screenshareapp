@@ -1,6 +1,6 @@
 {
   "name": "screenshare-p2p",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "High-quality peer-to-peer screen sharing for Windows and macOS",
   "main": "src/main.js",
   "author": {
@@ -15,7 +15,7 @@
     "dist:mac": "electron-builder --mac"
   },
   "devDependencies": {
-    "electron": "^30.0.0",
+    "electron": "^43.1.0",
     "electron-builder": "^24.13.3"
   },
   "dependencies": {

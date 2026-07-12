@@ -68,7 +68,7 @@ let maxSeenFrame = -1;
 let e2eRtt = 0;
 const stats = {
   outBytes: 0, outFrames: 0,
-  inBytes: 0, inFrames: 0,
+  inBytes: 0, inFrames: 0, inFrags: 0,
   nacksSent: 0, retx: 0,
   lastW: 0, lastH: 0
 };
@@ -85,6 +85,16 @@ function shortId() {
 }
 
 async function initNet() {
+  // GPU diagnostics up front — "hardware" here is the difference between
+  // buttery 60fps and a choked CPU encoder.
+  try {
+    const gpu = await window.desktop.gpuStatus();
+    log(`GPU: video_encode=${gpu.encode} | compositing=${gpu.compositing}`);
+    if (String(gpu.encode).includes('software')) {
+      log('⚠ Hardversko enkodiranje NIJE aktivno — kvalitet će patiti. Javi ovu liniju!');
+    }
+  } catch { /* diag only */ }
+
   await window.net.start({ host: SERVER_HOST, port: SERVER_PORT, user: NET_USER, pass: NET_PASS });
   myCode = shortId();
   myIdInput.value = myCode;
@@ -95,14 +105,15 @@ async function initNet() {
 
   window.net.onEvent(onNetEvent);
 
-  // E2E ping through the relay every 2s while paired.
+  // E2E ping through the relay every 500ms while paired — feeds the adaptive
+  // rate controller (RTT bloat detection needs fresh samples).
   setInterval(() => {
     if (!peerPresent) return;
     const b = new Uint8Array(10);
     b[0] = 1; b[1] = 3;
     new DataView(b.buffer).setFloat64(2, performance.now());
     window.net.sendFrags([b], 'ctrl');
-  }, 2000);
+  }, 500);
 }
 
 function onNetEvent(evt) {
@@ -243,17 +254,19 @@ let skipCount = 0;
 let encCount = 0;
 
 function encoderConfigFor(c, bps) {
-  return {
+  const cfg = {
     codec: c.codec,
     hardwareAcceleration: c.hardwareAcceleration,
     width: encDims.w,
     height: encDims.h,
     framerate: encDims.fps,
     bitrate: bps,
-    bitrateMode: 'constant',
     latencyMode: 'realtime',
     avc: { format: 'annexb' }
   };
+  // Some hardware encoders reject 'constant' — candidates carry their mode.
+  if (c.bmode) cfg.bitrateMode = c.bmode;
+  return cfg;
 }
 
 async function startEncoder(track, w, h, fps) {
@@ -261,14 +274,17 @@ async function startEncoder(track, w, h, fps) {
   window.net.setRate(bps);
   encDims = { w, h, fps };
 
-  // Hardware H.264 first; software fallbacks after. High profile level 5.2
-  // covers 4K60 (and ultrawide widths).
-  const all = [
-    { codec: 'avc1.640034', hardwareAcceleration: 'prefer-hardware' },
-    { codec: 'avc1.64002A', hardwareAcceleration: 'prefer-hardware' },
-    { codec: 'avc1.640034', hardwareAcceleration: 'no-preference' },
-    { codec: 'avc1.42E034', hardwareAcceleration: 'no-preference' }
-  ];
+  // Hardware first across H.264 profiles (High/Main/Baseline) and BOTH
+  // bitrate modes — many hardware encoders reject 'constant' but happily do
+  // 'variable' (we drive the rate ourselves anyway). Software comes last.
+  const all = [];
+  for (const hw of ['prefer-hardware', 'no-preference']) {
+    for (const codec of ['avc1.640034', 'avc1.4d0034', 'avc1.42E034']) {
+      for (const bmode of ['constant', null]) {
+        all.push({ codec, hardwareAcceleration: hw, bmode });
+      }
+    }
+  }
   encCandidates = [];
   for (const c of all) {
     try {
@@ -328,9 +344,58 @@ function buildEncoder(bps) {
     }
   });
   encoder.configure(encoderConfigFor(c, bps));
-  decoderCodec = c.codec;
+  decoderCodec = 'avc1.640034'; // decoder-side hint; High 5.2 decodes any profile below
   wantKey = true;
-  log(`Enkoder: ${c.codec} (${c.hardwareAcceleration}) · CBR ${(bps / 1e6).toFixed(0)} Mbps · ${encDims.w}x${encDims.h}`);
+  log(`Enkoder: ${c.codec} (${c.hardwareAcceleration}, ${c.bmode || 'variable'}) · ${(bps / 1e6).toFixed(0)} Mbps · ${encDims.w}x${encDims.h}`);
+}
+
+// ---------------------------------------------------------------------------
+// Adaptive rate control: hold the slider target, but back off BEFORE the link
+// melts (RTT bloat / reported loss), then climb back when clean. This is what
+// keeps a 20 Mbps uplink usable instead of 1000ms-ping bufferbloat.
+// ---------------------------------------------------------------------------
+let targetBps = 0;
+let rttBase = Infinity;
+let cleanSecs = 0;
+let lastRemoteLoss = 0;
+
+function adaptTick() {
+  if (!pumping || !encoder || encoder.state !== 'configured') return;
+  const slider = Number(el('bitrate').value);
+  if (!targetBps) targetBps = slider;
+
+  const rtt = e2eRtt || 0;
+  if (rtt) rttBase = Math.min(rttBase, rtt);
+  const bloated = rtt && rttBase !== Infinity && rtt > rttBase + 200;
+  const loss = lastRemoteLoss;
+  lastRemoteLoss = 0;
+
+  let next = targetBps;
+  let reason = '';
+  if (loss > 8 || (bloated && rtt > rttBase + 400)) {
+    next = targetBps * 0.55;
+    reason = loss > 8 ? `gubitak ${loss}%` : `RTT ${rtt}ms`;
+    cleanSecs = 0;
+  } else if (loss > 3 || bloated) {
+    next = targetBps * 0.8;
+    reason = loss > 3 ? `gubitak ${loss}%` : `RTT ${rtt}ms`;
+    cleanSecs = 0;
+  } else {
+    cleanSecs++;
+    if (cleanSecs >= 3 && targetBps < slider) {
+      next = Math.min(slider, targetBps * 1.15);
+      reason = 'link čist, dižem';
+    }
+  }
+  next = Math.max(3_000_000, Math.min(slider, next));
+  if (Math.abs(next - targetBps) > targetBps * 0.02) {
+    targetBps = next;
+    window.net.setRate(next);
+    try {
+      encoder.configure(encoderConfigFor(encCandidates[encCandidateIdx], next));
+    } catch { /* keep old */ }
+    log(`Adaptivni bitrate: ${(next / 1e6).toFixed(1)} Mbps (${reason})`);
+  }
 }
 
 function onEncodedChunk(chunk) {
@@ -390,12 +455,14 @@ stopBtn.addEventListener('click', stopSharing);
   el(id).addEventListener('change', () => {
     const bps = Number(el('bitrate').value);
     window.net.setRate(bps);
+    targetBps = bps; // reset the adaptive controller to the new ceiling
+    cleanSecs = 0;
     if (encoder && encoder.state === 'configured') {
       try {
         encDims.fps = Number(el('fps').value);
         encoder.configure(encoderConfigFor(encCandidates[encCandidateIdx], bps));
         wantKey = true;
-        log(`CBR promenjen: ${(bps / 1e6).toFixed(0)} Mbps`);
+        log(`Bitrate promenjen: ${(bps / 1e6).toFixed(0)} Mbps`);
       } catch (e) {
         log('Reconfigure nije uspeo: ' + e.message);
       }
@@ -423,6 +490,7 @@ function onVideoFrag(buf) {
   const payload = buf.subarray(14);
 
   stats.inBytes += payload.length;
+  stats.inFrags++;
   if (frameId > maxSeenFrame) maxSeenFrame = frameId;
   if (frameId <= lastDecoded || complete.has(frameId)) return; // stale/dup
 
@@ -616,6 +684,9 @@ function onCtrl(buf) {
     case 4: // e2e pong
       if (buf.length >= 10) e2eRtt = Math.round(performance.now() - dv.getFloat64(2));
       break;
+    case 6: // remote loss report (their receive loss of OUR stream)
+      if (buf.length >= 3) lastRemoteLoss = Math.max(lastRemoteLoss, buf[2]);
+      break;
   }
 }
 
@@ -630,8 +701,16 @@ setInterval(() => {
     parts.push(`⇣ gledaš ${stats.lastW}×${stats.lastH} @ ${stats.inFrames}fps · ${inMbps} Mbps`);
   }
   if (stats.outFrames > 0) {
-    parts.push(`⇡ šalješ ${encDims.w}×${encDims.h} @ ${stats.outFrames}fps · ${outMbps} Mbps`);
+    const tgt = targetBps ? ` (cilj ${(targetBps / 1e6).toFixed(1)})` : '';
+    parts.push(`⇡ šalješ ${encDims.w}×${encDims.h} @ ${stats.outFrames}fps · ${outMbps}${tgt} Mbps`);
   }
+  // Report OUR receive loss to the sender (feeds their adaptive controller).
+  if (peerPresent && (stats.inFrags > 0 || stats.nacksSent > 0)) {
+    const denom = stats.inFrags + stats.nacksSent;
+    const pct = denom ? Math.min(100, Math.round((stats.nacksSent / denom) * 100)) : 0;
+    window.net.sendFrags([new Uint8Array([1, 6, pct])], 'ctrl');
+  }
+  adaptTick();
   // Encoder starvation diagnostics: if we skip frames, the encoder can't keep
   // up (usually = software fallback) — say it out loud instead of just lagging.
   if (pumping && skipCount > encCount && skipCount > 10) {
@@ -646,6 +725,7 @@ setInterval(() => {
   }
   stats.inBytes = stats.outBytes = 0;
   stats.inFrames = stats.outFrames = 0;
+  stats.inFrags = 0;
   stats.nacksSent = 0;
 
   // GC stale partial frames (>2s old).

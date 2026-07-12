@@ -1,7 +1,8 @@
 const { contextBridge, ipcRenderer } = require('electron');
 
 contextBridge.exposeInMainWorld('desktop', {
-  getSources: () => ipcRenderer.invoke('get-sources')
+  getSources: () => ipcRenderer.invoke('get-sources'),
+  gpuStatus: () => ipcRenderer.invoke('gpu-status')
 });
 
 contextBridge.exposeInMainWorld('net', {
