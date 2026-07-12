@@ -146,11 +146,34 @@ function monitorPC(pc, role) {
     const st = pc.iceConnectionState;
     log(`ICE (${role}): ${st}`);
     if (st === 'connected' || st === 'completed') {
-      log('✓ DIREKTNA VEZA uspostavljena!');
+      log('✓ VEZA uspostavljena!');
+      logSelectedPair(pc);
     } else if (st === 'failed') {
       setStatus('Direktna veza nije uspela — mreža blokira P2P', 'error');
     }
   });
+}
+
+// Show which addresses actually connected (confirms Tailscale 100.x usage).
+async function logSelectedPair(pc) {
+  try {
+    const stats = await pc.getStats();
+    let pairId = null;
+    stats.forEach((r) => {
+      if (r.type === 'transport' && r.selectedCandidatePairId) pairId = r.selectedCandidatePairId;
+    });
+    stats.forEach((r) => {
+      if (r.type === 'candidate-pair' && (r.id === pairId || r.selected)) {
+        const local = stats.get(r.localCandidateId);
+        const remote = stats.get(r.remoteCandidateId);
+        if (local && remote) {
+          log(`↳ Putanja: ${local.address} (${local.candidateType}) → ${remote.address} (${remote.candidateType})`);
+        }
+      }
+    });
+  } catch {
+    /* ignore */
+  }
 }
 
 // Every second, read inbound video stats → tells us capture-vs-network.

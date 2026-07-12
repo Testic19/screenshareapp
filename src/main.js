@@ -1,6 +1,11 @@
 const { app, BrowserWindow, ipcMain, desktopCapturer, session } = require('electron');
 const path = require('path');
 
+// Expose real local IPs as ICE host candidates (Chromium hides them behind
+// mDNS .local by default). Needed so a Tailscale/ZeroTier virtual-LAN address
+// (100.x.x.x) is used → direct full-quality P2P over the virtual network.
+app.commandLine.appendSwitch('disable-features', 'WebRtcHideLocalIpsWithMdns');
+
 function createWindow() {
   const win = new BrowserWindow({
     width: 1280,
