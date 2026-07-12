@@ -85,7 +85,7 @@ function initPeer() {
     if (existing) existing.close();
     // Answer WITH our stream when we're sharing: both directions ride ONE
     // connection (half the TURN allocations of two separate calls).
-    call.answer(localStream || undefined);
+    call.answer(localStream || undefined, { sdpTransform: sdpBoost });
     if (localStream) log('Odgovaram sa svojim ekranom (dvosmerna veza).');
     wireIncoming(call);
   });
@@ -212,8 +212,7 @@ function stopStats() {
 }
 function startStats(pc) {
   stopStats();
-  let lastBytes = 0;
-  let lastTs = 0;
+  let inBytes = 0, inTs = 0, outBytes = 0, outTs = 0;
   let zeroCount = 0;
   statsTimer = setInterval(async () => {
     let stats;
@@ -222,30 +221,46 @@ function startStats(pc) {
     } catch {
       return;
     }
+    let inbound = null, outbound = null;
     stats.forEach((r) => {
-      if (r.type !== 'inbound-rtp' || r.kind !== 'video') return;
-      const mbps =
-        lastTs && r.timestamp > lastTs
-          ? (((r.bytesReceived - lastBytes) * 8) / (r.timestamp - lastTs) / 1000).toFixed(1)
-          : '…';
-      lastBytes = r.bytesReceived;
-      lastTs = r.timestamp;
-      const fps = r.framesPerSecond != null ? Math.round(r.framesPerSecond) : 0;
-
-      if (r.frameWidth && r.framesReceived > 0) {
-        // Frames ARE arriving → connection + capture OK.
-        setStatus(`UŽIVO — ${r.frameWidth}×${r.frameHeight} @ ${fps}fps · ${mbps} Mbps`, 'live');
-      } else {
-        // Stream exists but no pixels → almost always network/TURN.
-        zeroCount++;
-        setStatus(
-          zeroCount > 4
-            ? '⚠ Nema video frejmova — mreža blokira P2P (TURN problem)'
-            : 'Povezivanje video toka…',
-          zeroCount > 4 ? 'error' : 'waiting'
-        );
-      }
+      if (r.kind !== 'video') return;
+      if (r.type === 'inbound-rtp') inbound = r;
+      if (r.type === 'outbound-rtp') outbound = r;
     });
+
+    let outTxt = '';
+    if (outbound) {
+      const mbps = outTs && outbound.timestamp > outTs
+        ? ((outbound.bytesSent - outBytes) * 8 / (outbound.timestamp - outTs) / 1000).toFixed(1)
+        : '…';
+      outBytes = outbound.bytesSent;
+      outTs = outbound.timestamp;
+      const fps = outbound.framesPerSecond != null ? Math.round(outbound.framesPerSecond) : 0;
+      if (outbound.frameWidth) {
+        outTxt = `⇡ šalješ ${outbound.frameWidth}×${outbound.frameHeight} @ ${fps}fps · ${mbps} Mbps`;
+      }
+    }
+
+    if (inbound && inbound.frameWidth && inbound.framesReceived > 0) {
+      const mbps = inTs && inbound.timestamp > inTs
+        ? ((inbound.bytesReceived - inBytes) * 8 / (inbound.timestamp - inTs) / 1000).toFixed(1)
+        : '…';
+      inBytes = inbound.bytesReceived;
+      inTs = inbound.timestamp;
+      const fps = inbound.framesPerSecond != null ? Math.round(inbound.framesPerSecond) : 0;
+      const inTxt = `⇣ gledaš ${inbound.frameWidth}×${inbound.frameHeight} @ ${fps}fps · ${mbps} Mbps`;
+      setStatus(outTxt ? `${inTxt} | ${outTxt}` : `UŽIVO — ${inTxt}`, 'live');
+    } else if (outTxt) {
+      setStatus(`UŽIVO — ${outTxt}`, 'live');
+    } else if (inbound) {
+      zeroCount++;
+      setStatus(
+        zeroCount > 4
+          ? '⚠ Nema video frejmova — mreža blokira P2P (TURN problem)'
+          : 'Povezivanje video toka…',
+        zeroCount > 4 ? 'error' : 'waiting'
+      );
+    }
   }, 1000);
 }
 
@@ -352,16 +367,66 @@ async function startCapture(sourceId) {
   }
 }
 
+// Boost the bandwidth estimator via SDP: Chrome's estimator ramps slowly and
+// conservatively through a TURN relay (we measured the path clean at 40 Mbps
+// while the encoder sat at ~5). x-google-{start,min,max}-bitrate on the video
+// codecs makes the sender start high and never sink below a floor. The flags
+// take effect on the REMOTE side's sender, so both peers apply the transform
+// (call + answer) to boost both directions.
+function sdpBoost(sdp) {
+  const kbps = Math.round(Number(el('bitrate').value) / 1000);
+  const start = Math.round(kbps * 0.75);
+  const min = Math.round(kbps * 0.4);
+  const flags = `x-google-min-bitrate=${min};x-google-start-bitrate=${start};x-google-max-bitrate=${kbps}`;
+
+  const lines = sdp.split('\r\n');
+  // Collect video codec payload types (skip rtx/red/fec).
+  const videoPts = new Set();
+  let inVideo = false;
+  for (const l of lines) {
+    if (l.startsWith('m=')) inVideo = l.startsWith('m=video');
+    else if (inVideo) {
+      const m = l.match(/^a=rtpmap:(\d+) (VP8|VP9|H264|AV1)/i);
+      if (m) videoPts.add(m[1]);
+    }
+  }
+  // Append flags to existing fmtp lines; add fmtp for codecs without one (VP8).
+  const withFmtp = new Set();
+  const out = [];
+  for (const l of lines) {
+    const m = l.match(/^a=fmtp:(\d+) /);
+    if (m && videoPts.has(m[1])) {
+      out.push(`${l};${flags}`);
+      withFmtp.add(m[1]);
+    } else {
+      out.push(l);
+    }
+  }
+  const final = [];
+  for (const l of out) {
+    final.push(l);
+    const m = l.match(/^a=rtpmap:(\d+) (VP8|VP9|H264|AV1)/i);
+    if (m && !withFmtp.has(m[1])) {
+      final.push(`a=fmtp:${m[1]} ${flags}`);
+      withFmtp.add(m[1]);
+    }
+  }
+  return final.join('\r\n');
+}
+
 function startCall(id) {
   if (!localStream) return;
-  const call = peer.call(id, localStream);
+  const call = peer.call(id, localStream, { sdpTransform: sdpBoost });
   activeCalls.set(id, call);
   // The other side may also be sharing back to us on this same call.
   call.on('stream', (stream) => showRemote(call, stream));
   call.on('close', () => handleCallClose(call));
   call.on('error', (e) => log('Greška poziva: ' + e));
 
-  withPC(call, (pc) => monitorPC(pc, 'slanje'));
+  withPC(call, (pc) => {
+    monitorPC(pc, 'slanje');
+    startStats(pc); // live outbound stats for the sender too
+  });
   applyQuality(call);
   setStatus('Šaljem ekran drugaru…', 'live');
   log(`Zovem ${id} sa mojim ekranom.`);
