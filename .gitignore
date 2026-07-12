@@ -1,4 +1,10 @@
 node_modules/
 dist/
+dist-server/
 *.log
 .DS_Store
+
+# Go build outputs
+/server/turnserver
+/server/turnserver.exe
+/server/*.test
