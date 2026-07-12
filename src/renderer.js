@@ -54,17 +54,16 @@ function initPeer() {
   peer = new Peer(id, {
     debug: 1,
     config: {
+      // Clean STUN-only set. Dead TURN entries were stalling ICE in "checking"
+      // and dragging it to "disconnected". Give the direct path a clean shot.
       iceServers: [
         { urls: 'stun:stun.l.google.com:19302' },
         { urls: 'stun:stun1.l.google.com:19302' },
-        { urls: 'stun:stun.cloudflare.com:3478' },
-        // Free public TURN relays (fallback for strict NAT/firewall).
-        // TCP/443 probija skoro sve firewall-e. Za max pouzdanost stavi svoj.
-        { urls: 'turn:openrelay.metered.ca:80', username: 'openrelayproject', credential: 'openrelayproject' },
-        { urls: 'turn:openrelay.metered.ca:443', username: 'openrelayproject', credential: 'openrelayproject' },
-        { urls: 'turn:openrelay.metered.ca:443?transport=tcp', username: 'openrelayproject', credential: 'openrelayproject' },
-        { urls: 'turns:openrelay.metered.ca:443?transport=tcp', username: 'openrelayproject', credential: 'openrelayproject' }
-      ]
+        { urls: 'stun:stun2.l.google.com:19302' },
+        { urls: 'stun:stun3.l.google.com:19302' },
+        { urls: 'stun:stun.cloudflare.com:3478' }
+      ],
+      iceCandidatePoolSize: 4
     }
   });
 
@@ -144,13 +143,13 @@ function withPC(call, cb, tries = 0) {
 // Log ICE/connection state so we can see WHERE it breaks.
 function monitorPC(pc, role) {
   pc.addEventListener('iceconnectionstatechange', () => {
-    log(`ICE (${role}): ${pc.iceConnectionState}`);
-    if (pc.iceConnectionState === 'failed') {
-      setStatus('Mreža blokira P2P — potreban je radni TURN server', 'error');
+    const st = pc.iceConnectionState;
+    log(`ICE (${role}): ${st}`);
+    if (st === 'connected' || st === 'completed') {
+      log('✓ DIREKTNA VEZA uspostavljena!');
+    } else if (st === 'failed') {
+      setStatus('Direktna veza nije uspela — mreža blokira P2P', 'error');
     }
-  });
-  pc.addEventListener('icecandidate', (e) => {
-    if (e.candidate && e.candidate.type === 'relay') log('Koristi se TURN relay ✓');
   });
 }
 
